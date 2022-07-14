@@ -25,20 +25,20 @@ async fn data_source_revert() -> anyhow::Result<()> {
     };
 
     let chain: Vec<BlockWithTriggers<Chain>> = {
-        let start_block_hash = H256::from_low_u64_be(0);
-        let start_block = BlockWithTriggers {
+        let block0_hash = H256::from_low_u64_be(0);
+        let block0 = BlockWithTriggers {
             block: BlockFinality::Final(Arc::new(LightEthereumBlock {
-                hash: Some(start_block_hash),
+                hash: Some(block0_hash),
                 number: Some(U64::from(0)),
                 ..Default::default()
             })),
             trigger_data: vec![],
         };
-        let block_2 = BlockWithTriggers::<Chain> {
+        let block1 = BlockWithTriggers::<Chain> {
             block: BlockFinality::Final(Arc::new(LightEthereumBlock {
                 hash: Some(H256::from_low_u64_be(1)),
                 number: Some(U64::from(1)),
-                parent_hash: start_block_hash,
+                parent_hash: block0_hash,
                 ..Default::default()
             })),
             trigger_data: vec![EthereumTrigger::Block(
@@ -46,23 +46,23 @@ async fn data_source_revert() -> anyhow::Result<()> {
                 EthereumBlockTriggerType::Every,
             )],
         };
-        let block_2_reorged_hash = H256::from_low_u64_be(12);
-        let block_2_reorged = BlockWithTriggers::<Chain> {
+        let block1_hash_reorged = H256::from_low_u64_be(11);
+        let block1_reorged = BlockWithTriggers::<Chain> {
             block: BlockFinality::Final(Arc::new(LightEthereumBlock {
-                hash: Some(block_2_reorged_hash),
+                hash: Some(block1_hash_reorged),
                 number: Some(U64::from(1)),
-                parent_hash: start_block_hash,
+                parent_hash: block0_hash,
                 ..Default::default()
             })),
             trigger_data: vec![EthereumTrigger::Block(
                 BlockPtr {
-                    hash: block_2_reorged_hash.into(),
+                    hash: block1_hash_reorged.into(),
                     number: 1,
                 },
                 EthereumBlockTriggerType::Every,
             )],
         };
-        vec![start_block, block_2, block_2_reorged]
+        vec![block0, block1, block1_reorged]
     };
 
     let stop_block = chain.last().unwrap().block.ptr();
