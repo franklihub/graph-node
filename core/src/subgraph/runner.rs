@@ -666,6 +666,13 @@ where
                     }
                 }
 
+                if let Some(stop_block) = &self.inputs.stop_block {
+                    if block_ptr.number >= *stop_block {
+                        info!(self.logger, "stop block reached for subgraph");
+                        return Ok(Action::Stop);
+                    }
+                }
+
                 if matches!(action, Action::Restart) {
                     // Cancel the stream for real
                     self.ctx
@@ -676,13 +683,6 @@ where
 
                     // And restart the subgraph
                     return Ok(Action::Restart);
-                }
-
-                if let Some(stop_block) = &self.inputs.stop_block {
-                    if block_ptr.number >= *stop_block {
-                        info!(self.logger, "stop block reached for subgraph");
-                        return Ok(Action::Stop);
-                    }
                 }
 
                 return Ok(Action::Continue);
