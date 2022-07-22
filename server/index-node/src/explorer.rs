@@ -1,14 +1,18 @@
 //! Functionality to support the explorer in the hosted service. Everything
 //! in this file is private API and experimental and subject to change at
 //! any time
-use graph::prelude::r;
 use http::{Response, StatusCode};
 use hyper::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     CONTENT_TYPE,
 };
 use hyper::Body;
-use std::{sync::Arc, time::Instant};
+use std::{
+    env,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use graph::{
     components::{
@@ -17,9 +21,51 @@ use graph::{
     },
     data::subgraph::status,
     object,
-    prelude::{serde_json, warn, Logger, ENV_VARS},
+    prelude::{lazy_static, q, serde_json, warn, Logger, SerializableValue},
     util::timed_cache::TimedCache,
 };
+
+lazy_static! {
+    static ref TTL: Duration = {
+        let ttl = env::var("GRAPH_EXPLORER_TTL")
+            .ok()
+            .map(|s| {
+                u64::from_str(&s).unwrap_or_else(|_| {
+                    panic!("GRAPH_EXPLORER_TTL must be a number, but is `{}`", s)
+                })
+            })
+            .unwrap_or(10);
+        Duration::from_secs(ttl)
+    };
+    static ref LOCK_THRESHOLD: Duration = {
+        let duration = env::var("GRAPH_EXPLORER_LOCK_THRESHOLD")
+            .ok()
+            .map(|s| {
+                u64::from_str(&s).unwrap_or_else(|_| {
+                    panic!(
+                        "GRAPH_EXPLORER_LOCK_THRESHOLD must be a number, but is `{}`",
+                        s
+                    )
+                })
+            })
+            .unwrap_or(100);
+        Duration::from_millis(duration)
+    };
+    static ref QUERY_THRESHOLD: Duration = {
+        let duration = env::var("GRAPH_EXPLORER_QUERY_THRESHOLD")
+            .ok()
+            .map(|s| {
+                u64::from_str(&s).unwrap_or_else(|_| {
+                    panic!(
+                        "GRAPH_EXPLORER_QUERY_THRESHOLD must be a number, but is `{}`",
+                        s
+                    )
+                })
+            })
+            .unwrap_or(500);
+        Duration::from_millis(duration)
+    };
+}
 
 // Do not implement `Clone` for this; the IndexNode service puts the `Explorer`
 // behind an `Arc` so we don't have to put each `Cache` into an `Arc`
@@ -29,9 +75,9 @@ use graph::{
 #[derive(Debug)]
 pub struct Explorer<S> {
     store: Arc<S>,
-    versions: TimedCache<String, r::Value>,
+    versions: TimedCache<String, q::Value>,
     version_infos: TimedCache<String, VersionInfo>,
-    entity_counts: TimedCache<String, r::Value>,
+    entity_counts: TimedCache<String, q::Value>,
 }
 
 impl<S> Explorer<S>
@@ -41,9 +87,9 @@ where
     pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
-            versions: TimedCache::new(ENV_VARS.explorer_ttl),
-            version_infos: TimedCache::new(ENV_VARS.explorer_ttl),
-            entity_counts: TimedCache::new(ENV_VARS.explorer_ttl),
+            versions: TimedCache::new(*TTL),
+            version_infos: TimedCache::new(*TTL),
+            entity_counts: TimedCache::new(*TTL),
         }
     }
 
@@ -57,9 +103,6 @@ where
             ["subgraph-version", version] => self.handle_subgraph_version(version),
             ["subgraph-repo", version] => self.handle_subgraph_repo(version),
             ["entity-count", deployment] => self.handle_entity_count(logger, deployment),
-            ["subgraphs-for-deployment", deployment_hash] => {
-                self.handle_subgraphs_for_deployment(deployment_hash)
-            }
             _ => handle_not_found(),
         }
     }
@@ -122,7 +165,7 @@ where
     ) -> Result<Response<Body>, GraphQLServerError> {
         let start = Instant::now();
         let count = self.entity_counts.get(deployment);
-        if start.elapsed() > ENV_VARS.explorer_lock_threshold {
+        if start.elapsed() > *LOCK_THRESHOLD {
             let action = match count {
                 Some(_) => "cache_hit",
                 None => "cache_miss",
@@ -141,7 +184,7 @@ where
         let infos = self
             .store
             .status(status::Filter::Deployments(vec![deployment.to_string()]))?;
-        if start.elapsed() > ENV_VARS.explorer_query_threshold {
+        if start.elapsed() > *QUERY_THRESHOLD {
             warn!(logger, "Getting entity_count takes too long";
             "action" => "query_status",
             "deployment" => deployment,
@@ -159,7 +202,7 @@ where
         };
         let start = Instant::now();
         let resp = as_http_response(&value);
-        if start.elapsed() > ENV_VARS.explorer_lock_threshold {
+        if start.elapsed() > *LOCK_THRESHOLD {
             warn!(logger, "Getting entity_count takes too long";
             "action" => "as_http_response",
             "deployment" => deployment,
@@ -168,7 +211,7 @@ where
         let start = Instant::now();
         self.entity_counts
             .set(deployment.to_string(), Arc::new(value));
-        if start.elapsed() > ENV_VARS.explorer_lock_threshold {
+        if start.elapsed() > *LOCK_THRESHOLD {
             warn!(logger, "Getting entity_count takes too long";
                 "action" => "cache_set",
                 "deployment" => deployment,
@@ -187,25 +230,6 @@ where
             }
         }
     }
-
-    fn handle_subgraphs_for_deployment(
-        &self,
-        deployment_hash: &str,
-    ) -> Result<Response<Body>, GraphQLServerError> {
-        let name_version_pairs: Vec<r::Value> = self
-            .store
-            .subgraphs_for_deployment_hash(deployment_hash)?
-            .into_iter()
-            .map(|(name, version)| {
-                object! {
-                    name: name,
-                    version: version
-                }
-            })
-            .collect();
-        let payload = r::Value::List(name_version_pairs);
-        Ok(as_http_response(&payload))
-    }
 }
 
 fn handle_not_found() -> Result<Response<Body>, GraphQLServerError> {
@@ -217,9 +241,10 @@ fn handle_not_found() -> Result<Response<Body>, GraphQLServerError> {
         .unwrap())
 }
 
-fn as_http_response(value: &r::Value) -> http::Response<Body> {
+fn as_http_response(value: &q::Value) -> http::Response<Body> {
     let status_code = http::StatusCode::OK;
-    let json = serde_json::to_string(&value).expect("Failed to serialize response to JSON");
+    let json = serde_json::to_string(&SerializableValue(value))
+        .expect("Failed to serialize response to JSON");
     http::Response::builder()
         .status(status_code)
         .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")

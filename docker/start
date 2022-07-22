@@ -54,28 +54,42 @@ run_graph_node() {
     then
         # Start with a configuration file; we don't do a check whether
         # postgres is up in this case, though we probably should
-        wait_for_ipfs "$ipfs"
-        sleep 5
         graph-node \
             --node-id "${node_id//-/_}" \
             --config "$GRAPH_NODE_CONFIG" \
-            --ipfs "$ipfs" \
-            ${fork_base:+ --fork-base "$fork_base"}
+            --ipfs "$ipfs"
     else
         unset GRAPH_NODE_CONFIG
         postgres_port=${postgres_port:-5432}
-        postgres_url="postgresql://$postgres_user:$postgres_pass@$postgres_host:$postgres_port/$postgres_db?sslmode=prefer"
+        postgres_url="postgresql://$postgres_user:$postgres_pass@$postgres_host:$postgres_port/$postgres_db"
 
         wait_for_ipfs "$ipfs"
         wait_for "$postgres_host:$postgres_port" -t 120
         sleep 5
 
+        if $disable_block_ingestor
+        then
+            echo "DISABLE_BLOCK_INGESTOR.."
+            export DISABLE_BLOCK_INGESTOR=true
+        else
+            echo "unset DISABLE_BLOCK_INGESTOR.."
+            unset DISABLE_BLOCK_INGESTOR
+        fi
+        if $disable_subgraph
+        then
+            echo "DISABLE_SUBGRAPH.."
+            export DISABLE_SUBGRAPH=true
+        else
+            echo "unset DISABLE_BLOCK_INGESTOR.."
+            unset DISABLE_SUBGRAPH
+        fi
+
         graph-node \
             --node-id "${node_id//-/_}" \
             --postgres-url "$postgres_url" \
             --ethereum-rpc $ethereum \
-            --ipfs "$ipfs" \
-            ${fork_base:+ --fork-base "$fork_base"}
+            --ipfs "$ipfs"
+
     fi
 }
 

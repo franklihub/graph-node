@@ -16,8 +16,6 @@ use serde_json::json;
 use slog::*;
 use slog_async;
 
-use crate::util::futures::retry;
-
 /// General configuration parameters for Elasticsearch logging.
 #[derive(Clone, Debug)]
 pub struct ElasticLoggingConfig {
@@ -27,8 +25,6 @@ pub struct ElasticLoggingConfig {
     pub username: Option<String>,
     /// The Elasticsearch password (optional).
     pub password: Option<String>,
-    /// A client to serve as a connection pool to the endpoint.
-    pub client: Client,
 }
 
 /// Serializes an slog log level using a serde Serializer.
@@ -144,8 +140,6 @@ pub struct ElasticDrainConfig {
     pub custom_id_value: String,
     /// The batching interval.
     pub flush_interval: Duration,
-    /// Maximum retries in case of error.
-    pub max_retries: usize,
 }
 
 /// An slog `Drain` for logging to Elasticsearch.
@@ -193,7 +187,6 @@ impl ElasticDrain {
         let logs = self.logs.clone();
         let config = self.config.clone();
         let mut interval = tokio::time::interval(self.config.flush_interval);
-        let max_retries = self.config.max_retries;
 
         crate::task_spawn::spawn(async move {
             loop {
@@ -267,37 +260,31 @@ impl ElasticDrain {
                 batch_url.set_path("_bulk");
 
                 // Send batch of logs to Elasticsearch
+                let client = Client::new();
+                let logger_for_err = flush_logger.clone();
+
                 let header = match config.general.username {
-                    Some(username) => config
-                        .general
-                        .client
+                    Some(username) => client
                         .post(batch_url)
                         .header(CONTENT_TYPE, "application/json")
                         .basic_auth(username, config.general.password.clone()),
-                    None => config
-                        .general
-                        .client
+                    None => client
                         .post(batch_url)
                         .header(CONTENT_TYPE, "application/json"),
                 };
-
-                retry("send logs to elasticsearch", &flush_logger)
-                    .limit(max_retries)
-                    .timeout_secs(30)
-                    .run(move || {
-                        header
-                            .try_clone()
-                            .unwrap() // Unwrap: Request body not yet set
-                            .body(batch_body.clone())
-                            .send()
-                            .and_then(|response| async { response.error_for_status() })
-                            .map_ok(|_| ())
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
+                header
+                    .body(batch_body)
+                    .send()
+                    .and_then(|response| async { response.error_for_status() })
+                    .map_ok(|_| ())
+                    .unwrap_or_else(move |e| {
                         // Log if there was a problem sending the logs
-                        error!(flush_logger, "Failed to send logs to Elasticsearch: {}", e);
+                        error!(
+                            logger_for_err,
+                            "Failed to send logs to Elasticsearch: {}", e
+                        );
                     })
+                    .await;
             }
         });
     }
@@ -356,7 +343,7 @@ impl Drain for ElasticDrain {
         // Prepare log document
         let log = ElasticLog {
             id,
-            custom_id,
+            custom_id: custom_id,
             arguments,
             timestamp,
             text,

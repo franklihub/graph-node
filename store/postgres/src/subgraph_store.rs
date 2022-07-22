@@ -4,10 +4,7 @@ use diesel::{
     sql_types::Text,
     types::{FromSql, ToSql},
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, collections::HashMap, sync::Arc};
 use std::{fmt, io::Write};
 use std::{iter::FromIterator, time::Duration};
 
@@ -15,31 +12,29 @@ use graph::{
     cheap_clone::CheapClone,
     components::{
         server::index_node::VersionInfo,
-        store::{self, BlockStore, DeploymentLocator, EnsLookup as EnsLookupTrait, SubgraphFork},
+        store::{self, DeploymentLocator, EntityType, WritableStore as WritableStoreTrait},
     },
     constraint_violation,
     data::query::QueryTarget,
-    data::subgraph::{schema::DeploymentCreate, status},
+    data::subgraph::schema::SubgraphError,
+    data::subgraph::status,
     prelude::StoreEvent,
+    prelude::SubgraphDeploymentEntity,
     prelude::{
         anyhow, futures03::future::join_all, lazy_static, o, web3::types::Address, ApiSchema,
-        BlockHash, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation, Logger,
-        MetricsRegistry, NodeId, PartialBlockPtr, Schema, StoreError, SubgraphName,
+        BlockPtr, DeploymentHash, DynTryFuture, Entity, EntityKey, EntityModification, Error,
+        Logger, NodeId, QueryExecutionError, Schema, StopwatchMetrics, StoreError, SubgraphName,
         SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode,
     },
-    url::Url,
     util::timed_cache::TimedCache,
 };
+use store::StoredDynamicDataSource;
 
-use crate::fork;
 use crate::{
     connection_pool::ConnectionPool,
-    deployment::SubgraphHealth,
     primary,
-    primary::{DeploymentId, Mirror as PrimaryMirror, Site},
+    primary::{DeploymentId, Site},
     relational::Layout,
-    writable::WritableStore,
-    NotificationSender,
 };
 use crate::{
     deployment_store::{DeploymentStore, ReplicaId},
@@ -54,6 +49,12 @@ pub struct Shard(String);
 lazy_static! {
     /// The name of the primary shard that contains all instance-wide data
     pub static ref PRIMARY_SHARD: Shard = Shard("primary".to_string());
+    /// Whether to disable the notifications that feed GraphQL
+    /// subscriptions; when the environment variable is set, no updates
+    /// about entity changes will be sent to query nodes
+    pub static ref SEND_SUBSCRIPTION_NOTIFICATIONS: bool = {
+      std::env::var("GRAPH_DISABLE_SUBSCRIPTION_NOTIFICATIONS").ok().is_none()
+    };
 }
 
 /// How long to cache information about a deployment site
@@ -78,7 +79,7 @@ impl Shard {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
             return Err(StoreError::InvalidIdentifier(format!(
-                "shard name `{}` is invalid: shard names must only contain lowercase alphanumeric characters or '_'", name
+                "shard names must only contain lowercase alphanumeric characters or '_'"
             )));
         }
         Ok(Shard(name))
@@ -108,29 +109,22 @@ impl ToSql<Text, Pg> for Shard {
     }
 }
 
-/// Decide where a new deployment should be placed based on the subgraph
-/// name and the network it is indexing. If the deployment can be placed,
-/// returns a list of eligible database shards for the deployment and the
-/// names of the indexers that should index it. The deployment should then
-/// be assigned to one of the returned indexers and placed into one of the
-/// shards.
+/// Decide where a new deployment should be placed based on the subgraph name
+/// and the network it is indexing. If the deployment can be placed, returns
+/// the name of the database shard for the deployment and the names of the
+/// indexers that should index it. The deployment should then be assigned to
+/// one of the returned indexers.
 pub trait DeploymentPlacer {
-    fn place(&self, name: &str, network: &str)
-        -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String>;
+    fn place(&self, name: &str, network: &str) -> Result<Option<(Shard, Vec<NodeId>)>, String>;
 }
 
 /// Tools for managing unused deployments
 pub mod unused {
-    use graph::prelude::chrono::Duration;
-
     pub enum Filter {
         /// List all unused deployments
         All,
         /// List only deployments that are unused but have not been removed yet
         New,
-        /// List only deployments that were recorded as unused at least this
-        /// long ago but have not been removed at
-        UnusedLongerThan(Duration),
     }
 }
 
@@ -188,10 +182,6 @@ pub mod unused {
 #[derive(Clone)]
 pub struct SubgraphStore {
     inner: Arc<SubgraphStoreInner>,
-    /// Base URL for the GraphQL endpoint from which
-    /// subgraph forks will fetch entities.
-    /// Example: https://api.thegraph.com/subgraphs/
-    fork_base: Option<Url>,
 }
 
 impl SubgraphStore {
@@ -213,40 +203,19 @@ impl SubgraphStore {
         logger: &Logger,
         stores: Vec<(Shard, ConnectionPool, Vec<ConnectionPool>, Vec<usize>)>,
         placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
-        sender: Arc<NotificationSender>,
-        fork_base: Option<Url>,
-        registry: Arc<dyn MetricsRegistry>,
     ) -> Self {
         Self {
-            inner: Arc::new(SubgraphStoreInner::new(
-                logger, stores, placer, sender, registry,
-            )),
-            fork_base,
+            inner: Arc::new(SubgraphStoreInner::new(logger, stores, placer)),
         }
     }
 
-    pub(crate) async fn get_proof_of_indexing(
+    pub(crate) fn get_proof_of_indexing<'a>(
         &self,
-        id: &DeploymentHash,
-        indexer: &Option<Address>,
+        id: &'a DeploymentHash,
+        indexer: &'a Option<Address>,
         block: BlockPtr,
-    ) -> Result<Option<[u8; 32]>, StoreError> {
-        self.inner.get_proof_of_indexing(id, indexer, block).await
-    }
-
-    pub(crate) async fn get_public_proof_of_indexing(
-        &self,
-        id: &DeploymentHash,
-        block_number: BlockNumber,
-        block_store: Arc<impl BlockStore>,
-    ) -> Result<Option<(PartialBlockPtr, [u8; 32])>, StoreError> {
-        self.inner
-            .get_public_proof_of_indexing(id, block_number, block_store)
-            .await
-    }
-
-    pub fn notification_sender(&self) -> Arc<NotificationSender> {
-        self.sender.clone()
+    ) -> DynTryFuture<'a, Option<[u8; 32]>> {
+        self.inner.clone().get_proof_of_indexing(id, indexer, block)
     }
 }
 
@@ -259,7 +228,8 @@ impl std::ops::Deref for SubgraphStore {
 }
 
 pub struct SubgraphStoreInner {
-    mirror: PrimaryMirror,
+    logger: Logger,
+    primary: ConnectionPool,
     stores: HashMap<Shard, Arc<DeploymentStore>>,
     /// Cache for the mapping from deployment id to shard/namespace/id. Only
     /// active sites are cached here to ensure we have a unique mapping from
@@ -269,9 +239,6 @@ pub struct SubgraphStoreInner {
     /// graph-node processes over time.
     sites: TimedCache<DeploymentHash, Site>,
     placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
-    sender: Arc<NotificationSender>,
-    writables: Mutex<HashMap<DeploymentId, Arc<WritableStore>>>,
-    registry: Arc<dyn MetricsRegistry>,
 }
 
 impl SubgraphStoreInner {
@@ -293,17 +260,12 @@ impl SubgraphStoreInner {
         logger: &Logger,
         stores: Vec<(Shard, ConnectionPool, Vec<ConnectionPool>, Vec<usize>)>,
         placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
-        sender: Arc<NotificationSender>,
-        registry: Arc<dyn MetricsRegistry>,
     ) -> Self {
-        let mirror = {
-            let pools = HashMap::from_iter(
-                stores
-                    .iter()
-                    .map(|(name, pool, _, _)| (name.clone(), pool.clone())),
-            );
-            PrimaryMirror::new(&pools)
-        };
+        let primary = stores
+            .iter()
+            .find(|(name, _, _, _)| name == &*PRIMARY_SHARD)
+            .map(|(_, pool, _, _)| pool.clone())
+            .expect("we always have a primary shard");
         let stores = HashMap::from_iter(stores.into_iter().map(
             |(name, main_pool, read_only_pools, weights)| {
                 let logger = logger.new(o!("shard" => name.to_string()));
@@ -320,14 +282,13 @@ impl SubgraphStoreInner {
             },
         ));
         let sites = TimedCache::new(SITES_CACHE_TTL);
+        let logger = logger.new(o!("shard" => PRIMARY_SHARD.to_string()));
         SubgraphStoreInner {
-            mirror,
+            logger,
+            primary,
             stores,
             sites,
             placer,
-            sender,
-            writables: Mutex::new(HashMap::new()),
-            registry,
         }
     }
 
@@ -359,8 +320,8 @@ impl SubgraphStoreInner {
             return Ok(site);
         }
 
-        let site = self
-            .mirror
+        let conn = self.primary_conn()?;
+        let site = conn
             .find_active_site(id)?
             .ok_or_else(|| StoreError::DeploymentNotFound(id.to_string()))?;
         let site = Arc::new(site);
@@ -374,8 +335,8 @@ impl SubgraphStoreInner {
             return Ok(site);
         }
 
-        let site = self
-            .mirror
+        let conn = self.primary_conn()?;
+        let site = conn
             .find_site_by_ref(id)?
             .ok_or_else(|| StoreError::DeploymentNotFound(id.to_string()))?;
         let site = Arc::new(site);
@@ -391,54 +352,19 @@ impl SubgraphStoreInner {
         let store = self
             .stores
             .get(&site.shard)
-            .ok_or_else(|| StoreError::UnknownShard(site.shard.to_string()))?;
+            .ok_or(StoreError::UnknownShard(site.shard.as_str().to_string()))?;
         Ok((store, site))
     }
 
-    pub(crate) fn for_site(&self, site: &Site) -> Result<&Arc<DeploymentStore>, StoreError> {
+    fn for_site(&self, site: &Site) -> Result<&Arc<DeploymentStore>, StoreError> {
         self.stores
             .get(&site.shard)
-            .ok_or_else(|| StoreError::UnknownShard(site.shard.to_string()))
+            .ok_or(StoreError::UnknownShard(site.shard.as_str().to_string()))
     }
 
-    pub(crate) fn layout(&self, id: &DeploymentHash) -> Result<Arc<Layout>, StoreError> {
+    fn layout(&self, id: &DeploymentHash) -> Result<Arc<Layout>, StoreError> {
         let (store, site) = self.store(id)?;
         store.find_layout(site)
-    }
-
-    fn place_on_node(
-        &self,
-        mut nodes: Vec<NodeId>,
-        default_node: NodeId,
-    ) -> Result<NodeId, StoreError> {
-        match nodes.len() {
-            0 => {
-                // This is really a configuration error
-                Ok(default_node)
-            }
-            1 => Ok(nodes.pop().unwrap()),
-            _ => {
-                let conn = self.primary_conn()?;
-
-                // unwrap is fine since nodes is not empty
-                let node = conn.least_assigned_node(&nodes)?.unwrap();
-                Ok(node)
-            }
-        }
-    }
-
-    fn place_in_shard(&self, mut shards: Vec<Shard>) -> Result<Shard, StoreError> {
-        match shards.len() {
-            0 => Ok(PRIMARY_SHARD.clone()),
-            1 => Ok(shards.pop().unwrap()),
-            _ => {
-                let conn = self.primary_conn()?;
-
-                // unwrap is fine since shards is not empty
-                let shard = conn.least_used_shard(&shards)?.unwrap();
-                Ok(shard)
-            }
-        }
     }
 
     fn place(
@@ -461,10 +387,16 @@ impl SubgraphStoreInner {
 
         match placement {
             None => Ok((PRIMARY_SHARD.clone(), default_node)),
-            Some((shards, nodes)) => {
-                let node = self.place_on_node(nodes, default_node)?;
-                let shard = self.place_in_shard(shards)?;
+            Some((_, nodes)) if nodes.is_empty() => {
+                // This is really a configuration error
+                Ok((PRIMARY_SHARD.clone(), default_node))
+            }
+            Some((shard, mut nodes)) if nodes.len() == 1 => Ok((shard, nodes.pop().unwrap())),
+            Some((shard, nodes)) => {
+                let conn = self.primary_conn()?;
 
+                // unwrap is fine since nodes is not empty
+                let node = conn.least_assigned_node(&nodes)?.unwrap();
                 Ok((shard, node))
             }
         }
@@ -484,7 +416,7 @@ impl SubgraphStoreInner {
         &self,
         name: SubgraphName,
         schema: &Schema,
-        deployment: DeploymentCreate,
+        deployment: SubgraphDeploymentEntity,
         node_id: NodeId,
         network_name: String,
         mode: SubgraphVersionSwitchingMode,
@@ -508,7 +440,7 @@ impl SubgraphStoreInner {
             //       the same deployment in another shard
             let (shard, node_id) = self.place(&name, &network_name, node_id)?;
             let conn = self.primary_conn()?;
-            let site = conn.allocate_site(shard, &schema.id, network_name)?;
+            let site = conn.allocate_site(shard.clone(), &schema.id, network_name)?;
             let node_id = conn.assigned_node(&site)?.unwrap_or(node_id);
             (site, node_id)
         };
@@ -551,7 +483,7 @@ impl SubgraphStoreInner {
             let changes =
                 pconn.create_subgraph_version(name, &site, node_id, mode, exists_and_synced)?;
             let event = StoreEvent::new(changes);
-            pconn.send_store_event(&self.sender, &event)?;
+            pconn.send_store_event(&event)?;
             Ok(())
         })?;
         Ok(site.as_ref().into())
@@ -581,7 +513,7 @@ impl SubgraphStoreInner {
         // The very last thing we do when we set up a copy here is assign it
         // to a node. Therefore, if `dst` is already assigned, this function
         // should not have been called.
-        if let Some(node) = self.mirror.assigned_node(dst.as_ref())? {
+        if let Some(node) = self.primary_conn()?.assigned_node(dst.as_ref())? {
             return Err(StoreError::Unknown(anyhow!(
                 "can not copy into deployment {} since it is already assigned to node `{}`",
                 dst_loc,
@@ -597,12 +529,20 @@ impl SubgraphStoreInner {
         }
 
         // Transmogrify the deployment into a new one
-        let deployment = DeploymentCreate {
+        let deployment = SubgraphDeploymentEntity {
             manifest: deployment.manifest,
+            failed: false,
+            health: deployment.health,
+            synced: false,
+            fatal_error: None,
+            non_fatal_errors: vec![],
             earliest_block: deployment.earliest_block.clone(),
+            latest_block: deployment.earliest_block,
             graft_base: Some(src.deployment.clone()),
             graft_block: Some(block),
-            debug_fork: deployment.debug_fork,
+            reorg_count: 0,
+            current_reorg_depth: 0,
+            max_reorg_depth: 0,
         };
 
         let graft_base = self.layout(&src.deployment)?;
@@ -631,7 +571,7 @@ impl SubgraphStoreInner {
             // the copy
             let changes = pconn.assign_subgraph(dst.as_ref(), &node)?;
             let event = StoreEvent::new(changes);
-            pconn.send_store_event(&self.sender, &event)?;
+            pconn.send_store_event(&event)?;
             Ok(())
         })?;
         Ok(dst.as_ref().into())
@@ -655,7 +595,7 @@ impl SubgraphStoreInner {
         &self,
         name: SubgraphName,
         schema: &Schema,
-        deployment: DeploymentCreate,
+        deployment: SubgraphDeploymentEntity,
         node_id: NodeId,
         network_name: String,
         mode: SubgraphVersionSwitchingMode,
@@ -665,7 +605,7 @@ impl SubgraphStoreInner {
 
     pub(crate) fn send_store_event(&self, event: &StoreEvent) -> Result<(), StoreError> {
         let conn = self.primary_conn()?;
-        conn.send_store_event(&self.sender, event)
+        conn.send_store_event(event)
     }
 
     /// Get a connection to the primary shard. Code must never hold one of these
@@ -674,8 +614,8 @@ impl SubgraphStoreInner {
     /// connections can deadlock the entire process if the pool runs out
     /// of connections in between getting the first one and trying to get the
     /// second one.
-    pub(crate) fn primary_conn(&self) -> Result<primary::Connection, StoreError> {
-        let conn = self.mirror.primary().get()?;
+    fn primary_conn(&self) -> Result<primary::Connection, StoreError> {
+        let conn = self.primary.get_with_timeout_warning(&self.logger)?;
         Ok(primary::Connection::new(conn))
     }
 
@@ -685,14 +625,17 @@ impl SubgraphStoreInner {
         for_subscription: bool,
     ) -> Result<(Arc<DeploymentStore>, Arc<Site>, ReplicaId), StoreError> {
         let id = match target {
-            QueryTarget::Name(name) => self.mirror.current_deployment_for_subgraph(&name)?,
+            QueryTarget::Name(name) => {
+                let conn = self.primary_conn()?;
+                conn.transaction(|| conn.current_deployment_for_subgraph(name))?
+            }
             QueryTarget::Deployment(id) => id,
         };
 
         let (store, site) = self.store(&id)?;
         let replica = store.replica_for_query(for_subscription)?;
 
-        Ok((store.clone(), site, replica))
+        Ok((store.clone(), site.clone(), replica))
     }
 
     /// Delete all entities. This function exists solely for integration tests
@@ -722,7 +665,7 @@ impl SubgraphStoreInner {
         &self,
         sites: Vec<Site>,
     ) -> Result<HashMap<Shard, Vec<Arc<Site>>>, StoreError> {
-        let sites: Vec<_> = sites.into_iter().map(Arc::new).collect();
+        let sites: Vec<_> = sites.into_iter().map(|site| Arc::new(site)).collect();
         for site in &sites {
             self.cache_active(site);
         }
@@ -754,7 +697,7 @@ impl SubgraphStoreInner {
             let store = self
                 .stores
                 .get(&shard)
-                .ok_or_else(|| StoreError::UnknownShard(shard.to_string()))?;
+                .ok_or(StoreError::UnknownShard(shard.to_string()))?;
             let ids = ids
                 .into_iter()
                 .map(|site| site.deployment.to_string())
@@ -781,28 +724,33 @@ impl SubgraphStoreInner {
         let store = self.for_site(site.as_ref())?;
 
         // Check that deployment is not assigned
-        let mut removable = self.mirror.assigned_node(site.as_ref())?.is_none();
-
-        // Check that it is not current/pending for any subgraph if it is
-        // the active deployment of that subgraph
-        if site.active {
-            if !self
-                .primary_conn()?
-                .subgraphs_using_deployment(site.as_ref())?
-                .is_empty()
-            {
-                removable = false;
+        match self.primary_conn()?.assigned_node(site.as_ref())? {
+            Some(node) => {
+                return Err(constraint_violation!(
+                    "deployment {} can not be removed since it is assigned to node {}",
+                    site.deployment.as_str(),
+                    node.as_str()
+                ));
             }
+            None => { /* ok */ }
         }
 
-        if removable {
-            store.drop_deployment(&site)?;
-
-            self.primary_conn()?.drop_site(site.as_ref())?;
-        } else {
-            self.primary_conn()?
-                .unused_deployment_is_used(site.as_ref())?;
+        // Check that it is not current/pending for any subgraph
+        let versions = self
+            .primary_conn()?
+            .subgraphs_using_deployment(site.as_ref())?;
+        if versions.len() > 0 {
+            return Err(constraint_violation!(
+                "deployment {} can not be removed \
+                since it is the current or pending version for the subgraph(s) {}",
+                site.deployment.as_str(),
+                versions.join(", "),
+            ));
         }
+
+        store.drop_deployment(&site)?;
+
+        self.primary_conn()?.drop_site(site.as_ref())?;
 
         Ok(())
     }
@@ -810,14 +758,14 @@ impl SubgraphStoreInner {
     pub(crate) fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError> {
         let sites = match filter {
             status::Filter::SubgraphName(name) => {
-                let deployments = self.mirror.deployments_for_subgraph(&name)?;
+                let deployments = self.primary_conn()?.deployments_for_subgraph(name)?;
                 if deployments.is_empty() {
                     return Ok(Vec::new());
                 }
                 deployments
             }
             status::Filter::SubgraphVersion(name, use_current) => {
-                let deployment = self.mirror.subgraph_version(&name, use_current)?;
+                let deployment = self.primary_conn()?.subgraph_version(name, use_current)?;
                 match deployment {
                     Some(deployment) => vec![deployment],
                     None => {
@@ -826,11 +774,11 @@ impl SubgraphStoreInner {
                 }
             }
             status::Filter::Deployments(deployments) => {
-                self.mirror.find_sites(&deployments, true)?
+                self.primary_conn()?.find_sites(deployments, true)?
             }
             status::Filter::DeploymentIds(ids) => {
-                let ids: Vec<_> = ids.into_iter().map(|id| id.into()).collect();
-                self.mirror.find_sites_by_id(&ids)?
+                let ids = ids.into_iter().map(|id| id.into()).collect();
+                self.primary_conn()?.find_sites_by_id(ids)?
             }
         };
 
@@ -842,15 +790,15 @@ impl SubgraphStoreInner {
             let store = self
                 .stores
                 .get(&shard)
-                .ok_or_else(|| StoreError::UnknownShard(shard.to_string()))?;
+                .ok_or(StoreError::UnknownShard(shard.to_string()))?;
             infos.extend(store.deployment_statuses(&sites)?);
         }
-        self.mirror.fill_assignments(&mut infos)?;
+        let infos = self.primary_conn()?.fill_assignments(infos)?;
         Ok(infos)
     }
 
     pub(crate) fn version_info(&self, version: &str) -> Result<VersionInfo, StoreError> {
-        if let Some((deployment_id, created_at)) = self.mirror.version_info(version)? {
+        if let Some((deployment_id, created_at)) = self.primary_conn()?.version_info(version)? {
             let id = DeploymentHash::new(deployment_id.clone())
                 .map_err(|id| constraint_violation!("illegal deployment id {}", id))?;
             let (store, site) = self.store(&id)?;
@@ -863,7 +811,7 @@ impl SubgraphStoreInner {
                 .first()
                 .ok_or_else(|| constraint_violation!("no chain info for {}", deployment_id))?;
             let latest_ethereum_block_number =
-                chain.latest_block.as_ref().map(|block| block.number());
+                chain.latest_block.as_ref().map(|ref block| block.number());
             let subgraph_info = store.subgraph_info(site.as_ref())?;
             let network = site.network.clone();
 
@@ -877,7 +825,7 @@ impl SubgraphStoreInner {
                 description: subgraph_info.description,
                 repository: subgraph_info.repository,
                 schema: subgraph_info.input,
-                network,
+                network: network.to_string(),
             };
             Ok(info)
         } else {
@@ -889,14 +837,9 @@ impl SubgraphStoreInner {
         &self,
         subgraph_id: &str,
     ) -> Result<(Option<String>, Option<String>), StoreError> {
-        self.mirror.versions_for_subgraph_id(subgraph_id)
-    }
+        let primary = self.primary_conn()?;
 
-    pub(crate) fn subgraphs_for_deployment_hash(
-        &self,
-        deployment_hash: &str,
-    ) -> Result<Vec<(String, String)>, StoreError> {
-        self.mirror.subgraphs_by_deployment_hash(deployment_hash)
+        primary.versions_for_subgraph_id(subgraph_id)
     }
 
     #[cfg(debug_assertions)]
@@ -916,55 +859,14 @@ impl SubgraphStoreInner {
         self.send_store_event(&event)
     }
 
-    pub(crate) async fn get_proof_of_indexing(
-        &self,
-        id: &DeploymentHash,
-        indexer: &Option<Address>,
+    pub(crate) fn get_proof_of_indexing<'a>(
+        self: Arc<Self>,
+        id: &'a DeploymentHash,
+        indexer: &'a Option<Address>,
         block: BlockPtr,
-    ) -> Result<Option<[u8; 32]>, StoreError> {
-        let (store, site) = self.store(id)?;
-        store.get_proof_of_indexing(site, indexer, block).await
-    }
-
-    pub(crate) async fn get_public_proof_of_indexing(
-        &self,
-        id: &DeploymentHash,
-        block_number: BlockNumber,
-        block_store: Arc<impl BlockStore>,
-    ) -> Result<Option<(PartialBlockPtr, [u8; 32])>, StoreError> {
-        let (store, site) = self.store(&id)?;
-
-        let chain_store = match block_store.chain_store(&site.network) {
-            Some(chain_store) => chain_store,
-            None => return Ok(None),
-        };
-        let mut hashes = chain_store.block_hashes_by_block_number(block_number)?;
-
-        // If we don't have this block or we have multiple versions of this block
-        // and using any of them could introduce non-deterministic because we don't
-        // know which one is the right one -> return no block hash
-        if hashes.is_empty() || hashes.len() > 1 {
-            return Ok(None);
-        }
-
-        // This `unwrap` is safe to do now
-        let block_hash = BlockHash::from(hashes.pop().unwrap());
-
-        let block_for_poi_query = BlockPtr::new(block_hash.clone(), block_number);
-        let indexer = Some(Address::zero());
-        let poi = store
-            .get_proof_of_indexing(site, &indexer, block_for_poi_query)
-            .await?;
-
-        Ok(poi.map(|poi| {
-            (
-                PartialBlockPtr {
-                    number: block_number,
-                    hash: Some(block_hash),
-                },
-                poi,
-            )
-        }))
+    ) -> DynTryFuture<'a, Option<[u8; 32]>> {
+        let (store, site) = self.store(&id).unwrap();
+        store.clone().get_proof_of_indexing(site, indexer, block)
     }
 
     // Only used by tests
@@ -972,7 +874,7 @@ impl SubgraphStoreInner {
     pub fn find(
         &self,
         query: graph::prelude::EntityQuery,
-    ) -> Result<Vec<graph::prelude::Entity>, graph::prelude::QueryExecutionError> {
+    ) -> Result<Vec<Entity>, QueryExecutionError> {
         let (store, site) = self.store(&query.subgraph_id)?;
         store.find(site, query)
     }
@@ -983,79 +885,17 @@ impl SubgraphStoreInner {
         shard: Shard,
     ) -> Result<Option<DeploymentLocator>, StoreError> {
         Ok(self
-            .mirror
+            .primary_conn()?
             .find_site_in_shard(hash, &shard)?
             .as_ref()
             .map(|site| site.into()))
-    }
-
-    pub async fn mirror_primary_tables(&self, logger: &Logger) {
-        join_all(
-            self.stores
-                .values()
-                .map(|store| store.mirror_primary_tables(logger)),
-        )
-        .await;
-    }
-
-    pub fn analyze(
-        &self,
-        deployment: &DeploymentLocator,
-        entity_name: &str,
-    ) -> Result<(), StoreError> {
-        let (store, site) = self.store(&deployment.hash)?;
-        store.analyze(site, entity_name)
-    }
-
-    pub async fn create_manual_index(
-        &self,
-        deployment: &DeploymentLocator,
-        entity_name: &str,
-        field_names: Vec<String>,
-        index_method: String,
-    ) -> Result<(), StoreError> {
-        let (store, site) = self.store(&deployment.hash)?;
-        store
-            .create_manual_index(site, entity_name, field_names, index_method)
-            .await
-    }
-
-    pub async fn indexes_for_entity(
-        &self,
-        deployment: &DeploymentLocator,
-        entity_name: &str,
-    ) -> Result<Vec<String>, StoreError> {
-        let (store, site) = self.store(&deployment.hash)?;
-        store.indexes_for_entity(site, entity_name).await
-    }
-
-    pub async fn drop_index_for_deployment(
-        &self,
-        deployment: &DeploymentLocator,
-        index_name: &str,
-    ) -> Result<(), StoreError> {
-        let (store, site) = self.store(&deployment.hash)?;
-        store.drop_index(site, index_name).await
-    }
-}
-
-struct EnsLookup {
-    primary: ConnectionPool,
-}
-
-impl EnsLookupTrait for EnsLookup {
-    fn find_name(&self, hash: &str) -> Result<Option<String>, StoreError> {
-        let conn = self.primary.get()?;
-        primary::Connection::new(conn).find_ens_name(hash)
     }
 }
 
 #[async_trait::async_trait]
 impl SubgraphStoreTrait for SubgraphStore {
-    fn ens_lookup(&self) -> Arc<dyn EnsLookupTrait> {
-        Arc::new(EnsLookup {
-            primary: self.mirror.primary().clone(),
-        })
+    fn find_ens_name(&self, hash: &str) -> Result<Option<String>, QueryExecutionError> {
+        Ok(self.primary_conn()?.find_ens_name(hash)?)
     }
 
     // FIXME: This method should not get a node_id
@@ -1063,7 +903,7 @@ impl SubgraphStoreTrait for SubgraphStore {
         &self,
         name: SubgraphName,
         schema: &Schema,
-        deployment: DeploymentCreate,
+        deployment: SubgraphDeploymentEntity,
         node_id: NodeId,
         network_name: String,
         mode: SubgraphVersionSwitchingMode,
@@ -1088,7 +928,7 @@ impl SubgraphStoreTrait for SubgraphStore {
         let pconn = self.primary_conn()?;
         pconn.transaction(|| -> Result<_, StoreError> {
             let changes = pconn.remove_subgraph(name)?;
-            pconn.send_store_event(&self.sender, &StoreEvent::new(changes))
+            pconn.send_store_event(&StoreEvent::new(changes))
         })
     }
 
@@ -1101,125 +941,261 @@ impl SubgraphStoreTrait for SubgraphStore {
         let pconn = self.primary_conn()?;
         pconn.transaction(|| -> Result<_, StoreError> {
             let changes = pconn.reassign_subgraph(site.as_ref(), node_id)?;
-            pconn.send_store_event(&self.sender, &StoreEvent::new(changes))
+            pconn.send_store_event(&StoreEvent::new(changes))
         })
     }
 
     fn assigned_node(&self, deployment: &DeploymentLocator) -> Result<Option<NodeId>, StoreError> {
         let site = self.find_site(deployment.id.into())?;
-        self.mirror.assigned_node(site.as_ref())
+        let primary = self.primary_conn()?;
+        primary.assigned_node(site.as_ref())
     }
 
     fn assignments(&self, node: &NodeId) -> Result<Vec<DeploymentLocator>, StoreError> {
-        self.mirror
+        let primary = self.primary_conn()?;
+        primary
             .assignments(node)
             .map(|sites| sites.iter().map(|site| site.into()).collect())
     }
 
     fn subgraph_exists(&self, name: &SubgraphName) -> Result<bool, StoreError> {
-        self.mirror.subgraph_exists(name)
-    }
-
-    fn entity_changes_in_block(
-        &self,
-        subgraph_id: &DeploymentHash,
-        block: BlockNumber,
-    ) -> Result<Vec<EntityOperation>, StoreError> {
-        let (store, site) = self.store(subgraph_id)?;
-        let changes = store.get_changes(site, block)?;
-        Ok(changes)
+        let primary = self.primary_conn()?;
+        primary.subgraph_exists(name)
     }
 
     fn input_schema(&self, id: &DeploymentHash) -> Result<Arc<Schema>, StoreError> {
-        let (store, site) = self.store(id)?;
-        let info = store.subgraph_info(&site)?;
+        let (store, site) = self.store(&id)?;
+        let info = store.subgraph_info(site.as_ref())?;
         Ok(info.input)
     }
 
     fn api_schema(&self, id: &DeploymentHash) -> Result<Arc<ApiSchema>, StoreError> {
-        let (store, site) = self.store(id)?;
+        let (store, site) = self.store(&id)?;
         let info = store.subgraph_info(&site)?;
         Ok(info.api)
     }
 
-    fn debug_fork(
+    fn writable(
+        &self,
+        deployment: &DeploymentLocator,
+    ) -> Result<Arc<dyn store::WritableStore>, StoreError> {
+        let site = self.find_site(deployment.id.into())?;
+        Ok(Arc::new(WritableStore::new(self.clone(), site)?))
+    }
+
+    fn writable_for_network_indexer(
         &self,
         id: &DeploymentHash,
-        logger: Logger,
-    ) -> Result<Option<Arc<dyn SubgraphFork>>, StoreError> {
-        let (store, site) = self.store(id)?;
-        let info = store.subgraph_info(&site)?;
-        let fork_id = info.debug_fork;
-        let schema = info.input;
-
-        match (self.fork_base.as_ref(), fork_id) {
-            (Some(base), Some(id)) => Ok(Some(Arc::new(fork::SubgraphFork::new(
-                base.clone(),
-                id,
-                schema,
-                logger,
-            )?))),
-            _ => Ok(None),
-        }
+    ) -> Result<Arc<dyn WritableStoreTrait>, StoreError> {
+        let site = self.site(id)?;
+        Ok(Arc::new(WritableStore::new(self.clone(), site)?))
     }
 
-    async fn writable(
-        self: Arc<Self>,
-        logger: Logger,
-        deployment: graph::components::store::DeploymentId,
-    ) -> Result<Arc<dyn store::WritableStore>, StoreError> {
-        let deployment = deployment.into();
-        // We cache writables to make sure calls to this method are
-        // idempotent and there is ever only one `WritableStore` for any
-        // deployment
-        if let Some(writable) = self.writables.lock().unwrap().get(&deployment) {
-            return Ok(writable.cheap_clone());
-        }
-
-        // Ideally the lower level functions would be asyncified.
-        let this = self.clone();
-        let site = graph::spawn_blocking_allow_panic(move || -> Result<_, StoreError> {
-            this.find_site(deployment)
-        })
-        .await
-        .unwrap()?; // Propagate panics, there shouldn't be any.
-
-        let writable = Arc::new(
-            WritableStore::new(self.as_ref().clone(), logger, site, self.registry.clone()).await?,
-        );
-        self.writables
-            .lock()
-            .unwrap()
-            .insert(deployment, writable.cheap_clone());
-        Ok(writable)
-    }
-
-    fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, StoreError> {
+    fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, Error> {
         match self.site(id) {
             Ok(_) => Ok(true),
             Err(StoreError::DeploymentNotFound(_)) => Ok(false),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
-    async fn least_block_ptr(&self, id: &DeploymentHash) -> Result<Option<BlockPtr>, StoreError> {
+    fn least_block_ptr(&self, id: &DeploymentHash) -> Result<Option<BlockPtr>, Error> {
         let (store, site) = self.store(id)?;
-        store.block_ptr(site.cheap_clone()).await
-    }
-
-    async fn is_healthy(&self, id: &DeploymentHash) -> Result<bool, StoreError> {
-        let (store, site) = self.store(id)?;
-        let health = store.health(&site).await?;
-        Ok(matches!(health, SubgraphHealth::Healthy))
+        store.block_ptr(site.as_ref())
     }
 
     /// Find the deployment locators for the subgraph with the given hash
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError> {
         Ok(self
-            .mirror
-            .find_sites(&[hash.to_string()], false)?
+            .primary_conn()?
+            .find_sites(vec![hash.to_string()], false)?
             .iter()
             .map(|site| site.into())
             .collect())
     }
+}
+
+/// A wrapper around `SubgraphStore` that only exposes functions that are
+/// safe to call from `WritableStore`, i.e., functions that either do not
+/// deal with anything that depends on a specific deployment
+/// location/instance, or where the result is independent of the deployment
+/// instance
+struct WritableSubgraphStore(SubgraphStore);
+
+impl WritableSubgraphStore {
+    fn primary_conn(&self) -> Result<primary::Connection, StoreError> {
+        self.0.primary_conn()
+    }
+
+    pub(crate) fn send_store_event(&self, event: &StoreEvent) -> Result<(), StoreError> {
+        self.0.send_store_event(event)
+    }
+
+    fn layout(&self, id: &DeploymentHash) -> Result<Arc<Layout>, StoreError> {
+        self.0.layout(id)
+    }
+}
+
+struct WritableStore {
+    store: WritableSubgraphStore,
+    writable: Arc<DeploymentStore>,
+    site: Arc<Site>,
+}
+
+impl WritableStore {
+    fn new(subgraph_store: SubgraphStore, site: Arc<Site>) -> Result<Self, StoreError> {
+        let store = WritableSubgraphStore(subgraph_store.clone());
+        let writable = subgraph_store.for_site(site.as_ref())?.clone();
+        Ok(Self {
+            store,
+            writable,
+            site,
+        })
+    }
+}
+use web3::types::H160;
+#[async_trait::async_trait]
+impl WritableStoreTrait for WritableStore {
+    async fn get_filter_addrs(&self, id: String) -> Result<Vec<H160>, Error> {
+        self.writable.get_filter_addrs(id)
+    }
+
+    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error> {
+        self.writable.block_ptr(self.site.as_ref())
+    }
+
+    fn block_cursor(&self) -> Result<Option<String>, StoreError> {
+        self.writable.block_cursor(self.site.as_ref())
+    }
+
+    fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
+        let store = &self.writable;
+
+        let graft_base = match store.graft_pending(&self.site.deployment)? {
+            Some((base_id, base_ptr)) => {
+                let src = self.store.layout(&base_id)?;
+                Some((src, base_ptr))
+            }
+            None => None,
+        };
+        store.start_subgraph(logger, self.site.clone(), graft_base)?;
+        self.store.primary_conn()?.copy_finished(self.site.as_ref())
+    }
+
+    fn revert_block_operations(&self, block_ptr_to: BlockPtr) -> Result<(), StoreError> {
+        let event = self
+            .writable
+            .revert_block_operations(self.site.clone(), block_ptr_to)?;
+        if *SEND_SUBSCRIPTION_NOTIFICATIONS {
+            self.store.send_store_event(&event)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn unfail(&self) -> Result<(), StoreError> {
+        self.writable.unfail(self.site.clone())
+    }
+
+    async fn fail_subgraph(&self, error: SubgraphError) -> Result<(), StoreError> {
+        self.writable
+            .fail_subgraph(self.site.deployment.clone(), error)
+            .await
+    }
+
+    fn supports_proof_of_indexing<'a>(self: Arc<Self>) -> DynTryFuture<'a, bool> {
+        self.writable
+            .clone()
+            .supports_proof_of_indexing(self.site.clone())
+    }
+
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
+        self.writable.get(self.site.cheap_clone(), key)
+    }
+
+    fn transact_block_operations(
+        &self,
+        block_ptr_to: BlockPtr,
+        firehose_cursor: Option<String>,
+        mods: Vec<EntityModification>,
+        stopwatch: StopwatchMetrics,
+        data_sources: Vec<StoredDynamicDataSource>,
+        deterministic_errors: Vec<SubgraphError>,
+    ) -> Result<(), StoreError> {
+        assert!(
+            same_subgraph(&mods, &self.site.deployment),
+            "can only transact operations within one shard"
+        );
+
+        let event = self.writable.transact_block_operations(
+            self.site.clone(),
+            block_ptr_to,
+            firehose_cursor,
+            mods,
+            stopwatch.cheap_clone(),
+            data_sources,
+            deterministic_errors,
+        )?;
+
+        let _section = stopwatch.start_section("send_store_event");
+        if *SEND_SUBSCRIPTION_NOTIFICATIONS {
+            self.store.send_store_event(&event)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get_many(
+        &self,
+        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+        self.writable
+            .get_many(self.site.cheap_clone(), ids_for_type)
+    }
+
+    async fn is_deployment_synced(&self) -> Result<bool, Error> {
+        Ok(self
+            .writable
+            .exists_and_synced(self.site.deployment.cheap_clone())
+            .await?)
+    }
+
+    fn unassign_subgraph(&self) -> Result<(), StoreError> {
+        let pconn = self.store.primary_conn()?;
+        pconn.transaction(|| -> Result<_, StoreError> {
+            let changes = pconn.unassign_subgraph(self.site.as_ref())?;
+            pconn.send_store_event(&StoreEvent::new(changes))
+        })
+    }
+
+    async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+        self.writable
+            .load_dynamic_data_sources(self.site.deployment.clone())
+            .await
+    }
+
+    fn deployment_synced(&self) -> Result<(), Error> {
+        let event = {
+            // Make sure we drop `pconn` before we call into the deployment
+            // store so that we do not hold two database connections which
+            // might come from the same pool and could therefore deadlock
+            let pconn = self.store.primary_conn()?;
+            pconn.transaction(|| -> Result<_, Error> {
+                let changes = pconn.promote_deployment(&self.site.deployment)?;
+                Ok(StoreEvent::new(changes))
+            })?
+        };
+
+        self.writable.deployment_synced(&self.site.deployment)?;
+
+        Ok(self.store.send_store_event(&event)?)
+    }
+
+    fn shard(&self) -> &str {
+        self.site.shard.as_str()
+    }
+}
+
+fn same_subgraph(mods: &Vec<EntityModification>, id: &DeploymentHash) -> bool {
+    mods.iter().all(|md| &md.entity_key().subgraph_id == id)
 }

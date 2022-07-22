@@ -2,11 +2,9 @@ use std::sync::Arc;
 
 use graph::{
     blockchain::{block_stream::BlockWithTriggers, BlockPtr},
-    prelude::{
-        web3::types::{Address, Bytes, Log, H160, H256, U64},
-        EthereumCall,
-    },
+    prelude::EthereumCall,
 };
+use web3::types::*;
 
 use crate::{
     chain::BlockFinality,
@@ -60,15 +58,15 @@ fn test_trigger_ordering() {
 
     // Event with transaction_index 1 and log_index 0;
     // should be the first element after sorting
-    let log1 = EthereumTrigger::Log(create_log(1, 0), None);
+    let log1 = EthereumTrigger::Log(create_log(1, 0));
 
     // Event with transaction_index 1 and log_index 1;
     // should be the second element after sorting
-    let log2 = EthereumTrigger::Log(create_log(1, 1), None);
+    let log2 = EthereumTrigger::Log(create_log(1, 1));
 
     // Event with transaction_index 2 and log_index 5;
     // should come after call1 and before call2 after sorting
-    let log3 = EthereumTrigger::Log(create_log(2, 5), None);
+    let log3 = EthereumTrigger::Log(create_log(2, 5));
 
     let triggers = vec![
         // Call triggers; these should be in the order 1, 2, 4, 3 after sorting

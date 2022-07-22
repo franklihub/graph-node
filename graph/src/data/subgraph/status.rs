@@ -1,10 +1,9 @@
 //! Support for the indexing status API
 
 use super::schema::{SubgraphError, SubgraphHealth};
-use crate::blockchain::BlockHash;
-use crate::components::store::{BlockNumber, DeploymentId};
+use crate::components::store::DeploymentId;
 use crate::data::graphql::{object, IntoValue};
-use crate::prelude::{r, BlockPtr, Value};
+use crate::prelude::{q, web3::types::H256, BlockPtr, Value};
 
 pub enum Filter {
     /// Get all versions for the named subgraph
@@ -23,8 +22,8 @@ pub enum Filter {
 pub struct EthereumBlock(BlockPtr);
 
 impl EthereumBlock {
-    pub fn new(hash: BlockHash, number: BlockNumber) -> Self {
-        EthereumBlock(BlockPtr::new(hash, number))
+    pub fn new(hash: H256, number: u64) -> Self {
+        EthereumBlock(BlockPtr::from((hash, number)))
     }
 
     pub fn to_ptr(self) -> BlockPtr {
@@ -37,7 +36,7 @@ impl EthereumBlock {
 }
 
 impl IntoValue for EthereumBlock {
-    fn into_value(self) -> r::Value {
+    fn into_value(self) -> q::Value {
         object! {
             __typename: "EthereumBlock",
             hash: self.0.hash_hex(),
@@ -61,18 +60,18 @@ pub struct ChainInfo {
     pub network: String,
     /// The current head block of the chain.
     pub chain_head_block: Option<EthereumBlock>,
-    /// The earliest block available for this subgraph (only the number).
-    pub earliest_block_number: BlockNumber,
+    /// The earliest block available for this subgraph.
+    pub earliest_block: Option<EthereumBlock>,
     /// The latest block that the subgraph has synced to.
     pub latest_block: Option<EthereumBlock>,
 }
 
 impl IntoValue for ChainInfo {
-    fn into_value(self) -> r::Value {
+    fn into_value(self) -> q::Value {
         let ChainInfo {
             network,
             chain_head_block,
-            earliest_block_number,
+            earliest_block,
             latest_block,
         } = self;
         object! {
@@ -81,11 +80,7 @@ impl IntoValue for ChainInfo {
             __typename: "EthereumIndexingStatus",
             network: network,
             chainHeadBlock: chain_head_block,
-            earliestBlock: object! {
-                __typename: "EarliestBlock",
-                number: earliest_block_number,
-                hash: "0x0"
-            },
+            earliestBlock: earliest_block,
             latestBlock: latest_block,
         }
     }
@@ -114,7 +109,7 @@ pub struct Info {
 }
 
 impl IntoValue for Info {
-    fn into_value(self) -> r::Value {
+    fn into_value(self) -> q::Value {
         let Info {
             id: _,
             subgraph,
@@ -127,7 +122,7 @@ impl IntoValue for Info {
             synced,
         } = self;
 
-        fn subgraph_error_to_value(subgraph_error: SubgraphError) -> r::Value {
+        fn subgraph_error_to_value(subgraph_error: SubgraphError) -> q::Value {
             let SubgraphError {
                 subgraph_id,
                 message,
@@ -144,23 +139,23 @@ impl IntoValue for Info {
                 block: object! {
                     __typename: "Block",
                     number: block_ptr.as_ref().map(|x| x.number),
-                    hash: block_ptr.map(|x| r::Value::from(Value::Bytes(x.hash.into()))),
+                    hash: block_ptr.map(|x| q::Value::from(Value::Bytes(x.hash.into()))),
                 },
                 deterministic: deterministic,
             }
         }
 
-        let non_fatal_errors: Vec<_> = non_fatal_errors
+        let non_fatal_errors: Vec<q::Value> = non_fatal_errors
             .into_iter()
             .map(subgraph_error_to_value)
             .collect();
-        let fatal_error_val = fatal_error.map_or(r::Value::Null, subgraph_error_to_value);
+        let fatal_error_val = fatal_error.map_or(q::Value::Null, subgraph_error_to_value);
 
         object! {
             __typename: "SubgraphIndexingStatus",
             subgraph: subgraph,
             synced: synced,
-            health: r::Value::from(health),
+            health: q::Value::from(health),
             fatalError: fatal_error_val,
             nonFatalErrors: non_fatal_errors,
             chains: chains.into_iter().map(|chain| chain.into_value()).collect::<Vec<_>>(),

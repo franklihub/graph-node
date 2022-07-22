@@ -2,64 +2,31 @@
 //! Any hash constructed from here should be the same as if the same data was given
 //! to the reference implementation, but this is updated incrementally
 
-use super::{ProofOfIndexingEvent, ProofOfIndexingVersion};
+use super::ProofOfIndexingEvent;
 use crate::{
     blockchain::BlockPtr,
-    prelude::{debug, BlockNumber, DeploymentHash, Logger, ENV_VARS},
-    util::stable_hash_glue::AsBytes,
+    prelude::{debug, BlockNumber, DeploymentHash, Logger},
 };
-use stable_hash::{fast::FastStableHasher, FieldAddress, StableHash, StableHasher};
-use stable_hash_legacy::crypto::{Blake3SeqNo, SetHasher};
-use stable_hash_legacy::prelude::{
-    StableHash as StableHashLegacy, StableHasher as StableHasherLegacy, *,
-};
+use lazy_static::lazy_static;
+use stable_hash::crypto::{Blake3SeqNo, SetHasher};
+use stable_hash::prelude::*;
+use stable_hash::utils::AsBytes;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt;
 use web3::types::Address;
 
+lazy_static! {
+    static ref LOG_EVENTS: bool = std::env::var("GRAPH_LOG_POI_EVENTS")
+        .unwrap_or_else(|_| "false".into())
+        .parse::<bool>()
+        .expect("invalid GRAPH_LOG_POI_EVENTS");
+}
+
 pub struct BlockEventStream {
-    vec_length: u64,
-    handler_start: u64,
-    block_index: u64,
-    hasher: Hashers,
-}
-
-enum Hashers {
-    Fast(FastStableHasher),
-    Legacy(SetHasher),
-}
-
-impl Hashers {
-    fn new(version: ProofOfIndexingVersion) -> Self {
-        match version {
-            ProofOfIndexingVersion::Legacy => Hashers::Legacy(SetHasher::new()),
-            ProofOfIndexingVersion::Fast => Hashers::Fast(FastStableHasher::new()),
-        }
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        match bytes.try_into() {
-            Ok(bytes) => Hashers::Fast(FastStableHasher::from_bytes(bytes)),
-            Err(_) => Hashers::Legacy(SetHasher::from_bytes(bytes)),
-        }
-    }
-
-    fn write<T>(&mut self, value: &T, children: &[u64])
-    where
-        T: StableHash + StableHashLegacy,
-    {
-        match self {
-            Hashers::Fast(fast) => {
-                let addr = children.iter().fold(u128::root(), |s, i| s.child(*i));
-                StableHash::stable_hash(value, addr, fast);
-            }
-            Hashers::Legacy(legacy) => {
-                let seq_no = traverse_seq_no(children);
-                StableHashLegacy::stable_hash(value, seq_no, legacy);
-            }
-        }
-    }
+    vec_length: usize,
+    seq_no: Blake3SeqNo,
+    digest: SetHasher,
 }
 
 /// Go directly to a SequenceNumber identifying a field within a struct.
@@ -92,23 +59,26 @@ impl Hashers {
 ///    0, // Vec<Inner>[0]
 ///    1, // Inner.inner_str
 ///])
-// Performance: Could write a specialized function for this, avoiding a bunch of clones of Blake3SeqNo
-fn traverse_seq_no(counts: &[u64]) -> Blake3SeqNo {
+// Performance: Could write a specialized function for this easily, avoiding a bunch of clones of Blake3SeqNo
+fn traverse_seq_no(counts: &[usize]) -> Blake3SeqNo {
     counts.iter().fold(Blake3SeqNo::root(), |mut s, i| {
-        s.skip(*i as usize);
+        s.skip(*i);
         s.next_child()
     })
 }
 
 impl BlockEventStream {
-    fn new(block_number: BlockNumber, version: ProofOfIndexingVersion) -> Self {
-        let block_index: u64 = block_number.try_into().unwrap();
-
+    fn new(block_number: BlockNumber) -> Self {
+        let events = traverse_seq_no(&[
+            1,                                // kvp -> v
+            0,                                // CausalityRegion.blocks: Vec<Block>
+            block_number.try_into().unwrap(), // Vec<Block> -> [i]
+            0,                                // Block.events -> Vec<ProofOfIndexingEvent>
+        ]);
         Self {
             vec_length: 0,
-            handler_start: 0,
-            block_index,
-            hasher: Hashers::new(version),
+            seq_no: events,
+            digest: SetHasher::new(),
         }
     }
 
@@ -117,50 +87,23 @@ impl BlockEventStream {
     /// when asking for the final PoI, or when combining with the next modified
     /// block via the argument `prev`
     pub fn pause(mut self, prev: Option<&[u8]>) -> Vec<u8> {
-        self.hasher
-            .write(&self.vec_length, &[1, 0, self.block_index, 0]);
-        match self.hasher {
-            Hashers::Legacy(mut digest) => {
-                if let Some(prev) = prev {
-                    let prev = SetHasher::from_bytes(prev);
-                    // SequenceNumber::root() is misleading here since the parameter
-                    // is unused.
-                    digest.finish_unordered(prev, SequenceNumber::root());
-                }
-                digest.to_bytes()
-            }
-            Hashers::Fast(mut digest) => {
-                if let Some(prev) = prev {
-                    let prev = prev
-                        .try_into()
-                        .expect("Expected valid fast stable hash representation");
-                    let prev = FastStableHasher::from_bytes(prev);
-                    digest.mixin(&prev);
-                }
-                digest.to_bytes().to_vec()
-            }
+        self.vec_length.stable_hash(self.seq_no, &mut self.digest);
+        let mut state = self.digest;
+        if let Some(prev) = prev {
+            let prev = SetHasher::from_bytes(prev);
+            state.finish_unordered(prev, SequenceNumber::root());
         }
+        state.to_bytes()
     }
 
     fn write(&mut self, event: &ProofOfIndexingEvent<'_>) {
-        let children = &[
-            1,                // kvp -> v
-            0,                // CausalityRegion.blocks: Vec<Block>
-            self.block_index, // Vec<Block> -> [i]
-            0,                // Block.events -> Vec<ProofOfIndexingEvent>
-            self.vec_length,
-        ];
-        self.hasher.write(&event, children);
         self.vec_length += 1;
-    }
-
-    fn start_handler(&mut self) {
-        self.handler_start = self.vec_length;
+        event.stable_hash(self.seq_no.next_child(), &mut self.digest);
     }
 }
 
+#[derive(Default)]
 pub struct ProofOfIndexing {
-    version: ProofOfIndexingVersion,
     block_number: BlockNumber,
     /// The POI is updated for each data source independently. This is necessary because
     /// some data sources (eg: IPFS files) may be unreliable and therefore cannot mix
@@ -176,28 +119,12 @@ impl fmt::Debug for ProofOfIndexing {
 }
 
 impl ProofOfIndexing {
-    pub fn new(block_number: BlockNumber, version: ProofOfIndexingVersion) -> Self {
+    pub fn new(block_number: BlockNumber) -> Self {
         Self {
-            version,
             block_number,
             per_causality_region: HashMap::new(),
         }
     }
-}
-
-impl ProofOfIndexing {
-    pub fn write_deterministic_error(&mut self, logger: &Logger, causality_region: &str) {
-        let redacted_events = self.with_causality_region(causality_region, |entry| {
-            entry.vec_length - entry.handler_start
-        });
-
-        self.write(
-            logger,
-            causality_region,
-            &ProofOfIndexingEvent::DeterministicError { redacted_events },
-        )
-    }
-
     /// Adds an event to the digest of the ProofOfIndexingStream local to the causality region
     pub fn write(
         &mut self,
@@ -205,7 +132,7 @@ impl ProofOfIndexing {
         causality_region: &str,
         event: &ProofOfIndexingEvent<'_>,
     ) {
-        if ENV_VARS.log_poi_events {
+        if *LOG_EVENTS {
             debug!(
                 logger,
                 "Proof of indexing event";
@@ -214,29 +141,16 @@ impl ProofOfIndexing {
             );
         }
 
-        self.with_causality_region(causality_region, |entry| entry.write(event))
-    }
-
-    pub fn start_handler(&mut self, causality_region: &str) {
-        self.with_causality_region(causality_region, |entry| entry.start_handler())
-    }
-
-    // This is just here because the raw_entry API is not stabilized.
-    fn with_causality_region<F, T>(&mut self, causality_region: &str, f: F) -> T
-    where
-        F: FnOnce(&mut BlockEventStream) -> T,
-    {
+        // This may be better with the raw_entry API, once that is stabilized
         if let Some(causality_region) = self.per_causality_region.get_mut(causality_region) {
-            f(causality_region)
+            causality_region.write(event);
         } else {
-            let mut entry = BlockEventStream::new(self.block_number, self.version);
-            let result = f(&mut entry);
+            let mut entry = BlockEventStream::new(self.block_number);
+            entry.write(event);
             self.per_causality_region
                 .insert(causality_region.to_owned(), entry);
-            result
         }
     }
-
     pub fn take(self) -> HashMap<String, BlockEventStream> {
         self.per_causality_region
     }
@@ -244,27 +158,34 @@ impl ProofOfIndexing {
 
 pub struct ProofOfIndexingFinisher {
     block_number: BlockNumber,
-    state: Hashers,
+    state: SetHasher,
     causality_count: usize,
 }
 
 impl ProofOfIndexingFinisher {
-    pub fn new(
-        block: &BlockPtr,
-        subgraph_id: &DeploymentHash,
-        indexer: &Option<Address>,
-        version: ProofOfIndexingVersion,
-    ) -> Self {
-        let mut state = Hashers::new(version);
+    pub fn new(block: &BlockPtr, subgraph_id: &DeploymentHash, indexer: &Option<Address>) -> Self {
+        let mut state = SetHasher::new();
 
-        // Add PoI.subgraph_id
-        state.write(&subgraph_id, &[1]);
+        // Add the subgraph id
+        let subgraph_id_seq_no = traverse_seq_no(&[
+            1, // PoI.subgraph_id
+        ]);
+        subgraph_id.stable_hash(subgraph_id_seq_no, &mut state);
 
-        // Add PoI.block_hash
-        state.write(&AsBytes(block.hash_slice()), &[2]);
+        // Add the block hash
+        let block_hash_seq_no = traverse_seq_no(&[
+            2, // PoI.block_hash
+        ]);
+        AsBytes(block.hash_slice()).stable_hash(block_hash_seq_no, &mut state);
 
-        // Add PoI.indexer
-        state.write(&indexer.as_ref().map(|i| AsBytes(i.as_bytes())), &[3]);
+        // Add the indexer
+        let indexer_seq_no = traverse_seq_no(&[
+            3, // PoI.indexer
+        ]);
+        indexer
+            .as_ref()
+            .map(|i| AsBytes(i.as_bytes()))
+            .stable_hash(indexer_seq_no, &mut state);
 
         ProofOfIndexingFinisher {
             block_number: block.number,
@@ -274,43 +195,48 @@ impl ProofOfIndexingFinisher {
     }
 
     pub fn add_causality_region(&mut self, name: &str, region: &[u8]) {
-        let mut state = Hashers::from_bytes(region);
+        let mut state = SetHasher::from_bytes(region);
 
-        // Finish the blocks vec by writing kvp[v], CausalityRegion.blocks.len()
+        // Finish the blocks vec
+        let blocks_seq_no = traverse_seq_no(&[
+            1, // kvp -> v
+            0, // CausalityRegion.blocks: Vec<Block>
+        ]);
         // + 1 is to account that the length of the blocks array for the genesis block is 1, not 0.
-        state.write(&(self.block_number + 1), &[1, 0]);
+        (self.block_number + 1).stable_hash(blocks_seq_no, &mut state);
 
-        // Add the name (kvp[k]).
-        state.write(&name, &[0]);
+        // Add the name.
+        let name_seq_no = traverse_seq_no(&[
+            0, // kvp -> k
+        ]);
+        name.stable_hash(name_seq_no, &mut state);
 
-        // Mixin the region into PoI.causality_regions.
-        match state {
-            Hashers::Legacy(legacy) => {
-                let state = legacy.finish();
-                self.state.write(&AsBytes(&state), &[0, 1]);
-            }
-            Hashers::Fast(fast) => {
-                let state = fast.to_bytes();
-                self.state.write(&AsBytes(&state), &[0]);
-            }
-        }
+        let state = state.finish();
 
+        // Mixin the region with the final value
+        let causality_regions_member_seq_no = traverse_seq_no(&[
+            0, // Poi.causality_regions
+            1, // unordered collection member
+        ]);
+
+        self.state.write(causality_regions_member_seq_no, &state);
         self.causality_count += 1;
     }
 
-    pub fn finish(mut self) -> [u8; 32] {
-        if let Hashers::Legacy(_) = self.state {
-            // Add PoI.causality_regions.len()
-            // Note that technically to get the same sequence number one would need
-            // to call causality_regions_count_seq_no.skip(self.causality_count);
-            // but it turns out that the result happens to be the same for
-            // non-negative numbers.
-            self.state.write(&self.causality_count, &[0, 2]);
-        }
+    pub fn finish(mut self) -> <SetHasher as StableHasher>::Out {
+        let causality_regions_count_seq_no = traverse_seq_no(&[
+            0, // Poi.causality_regions
+            2, // unordered collection count
+        ]);
 
-        match self.state {
-            Hashers::Legacy(legacy) => legacy.finish(),
-            Hashers::Fast(fast) => tiny_keccak::keccak256(&fast.finish().to_le_bytes()),
-        }
+        // Note that technically to get the same sequence number one would need
+        // to call causality_regions_count_seq_no.skip(self.causality_count);
+        // but it turns out that the result happens to be the same for
+        // non-negative numbers.
+
+        self.causality_count
+            .stable_hash(causality_regions_count_seq_no, &mut self.state);
+
+        self.state.finish()
     }
 }

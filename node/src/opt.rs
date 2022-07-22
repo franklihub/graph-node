@@ -34,14 +34,6 @@ pub struct Opt {
         help = "name and IPFS hash of the subgraph manifest"
     )]
     pub subgraph: Option<String>,
-
-    #[structopt(
-        long,
-        value_name = "BLOCK_HASH:BLOCK_NUMBER",
-        help = "block hash and number that the subgraph passed will start indexing at"
-    )]
-    pub start_block: Option<String>,
-
     #[structopt(
         long,
         value_name = "URL",
@@ -111,8 +103,7 @@ pub struct Opt {
         long,
         default_value = "8000",
         value_name = "PORT",
-        help = "Port for the GraphQL HTTP server",
-        env = "GRAPH_GRAPHQL_HTTP_PORT"
+        help = "Port for the GraphQL HTTP server"
     )]
     pub http_port: u16,
     #[structopt(
@@ -126,8 +117,7 @@ pub struct Opt {
         long,
         default_value = "8001",
         value_name = "PORT",
-        help = "Port for the GraphQL WebSocket server",
-        env = "GRAPH_GRAPHQL_WS_PORT"
+        help = "Port for the GraphQL WebSocket server"
     )]
     pub ws_port: u16,
     #[structopt(
@@ -149,7 +139,7 @@ pub struct Opt {
         default_value = "default",
         value_name = "NODE_ID",
         env = "GRAPH_NODE_ID",
-        help = "a unique identifier for this node. Should have the same value between consecutive node restarts"
+        help = "a unique identifier for this node"
     )]
     pub node_id: String,
     #[structopt(long, help = "Enable debug logging")]
@@ -202,19 +192,19 @@ pub struct Opt {
     pub store_connection_pool_size: u32,
     #[structopt(
         long,
-        help = "Allows setting configurations that may result in incorrect Proofs of Indexing."
+        min_values = 1,
+        value_name = "NETWORK_NAME",
+        help = "One or more network names to index using built-in subgraphs \
+                (e.g. 'ethereum/mainnet')."
     )]
-    pub unsafe_config: bool,
-
+    pub network_subgraphs: Vec<String>,
     #[structopt(
         long,
-        value_name = "IPFS_HASH",
-        help = "IPFS hash of the subgraph manifest that you want to fork"
+        value_name = "DISABLE_SUBGRAPH",
+        env = "DISABLE_SUBGRAPH",
+        help = "Ensures that the subgraph does not execute"
     )]
-    pub debug_fork: Option<String>,
-
-    #[structopt(long, value_name = "URL", help = "Base URL for forking subgraphs")]
-    pub fork_base: Option<String>,
+    pub disable_subgraph: bool,
 }
 
 impl From<Opt> for config::Opt {
@@ -230,10 +220,9 @@ impl From<Opt> for config::Opt {
             ethereum_rpc,
             ethereum_ws,
             ethereum_ipc,
-            unsafe_config,
+            disable_subgraph,
             ..
         } = opt;
-
         config::Opt {
             postgres_url,
             config,
@@ -245,7 +234,7 @@ impl From<Opt> for config::Opt {
             ethereum_rpc,
             ethereum_ws,
             ethereum_ipc,
-            unsafe_config,
+            disable_subgraph,
         }
     }
 }

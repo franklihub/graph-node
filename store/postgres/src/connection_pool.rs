@@ -10,7 +10,6 @@ use graph::cheap_clone::CheapClone;
 use graph::constraint_violation;
 use graph::prelude::tokio;
 use graph::prelude::tokio::time::Instant;
-use graph::slog::warn;
 use graph::util::timed_rw_lock::TimedMutex;
 use graph::{
     prelude::{
@@ -18,22 +17,56 @@ use graph::{
         crit, debug, error, info, o,
         tokio::sync::Semaphore,
         CancelGuard, CancelHandle, CancelToken as _, CancelableError, Counter, Gauge, Logger,
-        MetricsRegistry, MovingStats, PoolWaitStats, StoreError, ENV_VARS,
+        MetricsRegistry, MovingStats, PoolWaitStats, StoreError,
     },
     util::security::SafeDisplay,
 };
 
 use std::fmt::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, sync::RwLock};
 
 use postgres::config::{Config, Host};
 
-use crate::primary::{self, NAMESPACE_PUBLIC};
 use crate::{advisory_lock, catalog};
 use crate::{Shard, PRIMARY_SHARD};
+
+lazy_static::lazy_static! {
+    // There is typically no need to configure this. But this can be used to effectivey disable the
+    // query semaphore by setting it to a high number.
+    static ref EXTRA_QUERY_PERMITS: usize = {
+        std::env::var("GRAPH_EXTRA_QUERY_PERMITS")
+            .ok()
+            .map(|s| {
+                usize::from_str(&s).unwrap_or_else(|_| {
+                    panic!("GRAPH_EXTRA_QUERY_PERMITS must be a number, but is `{}`", s)
+                })
+            })
+            .unwrap_or(0)
+    };
+
+    // These environment variables should really be set through the
+    // configuration file; especially for min_idle and idle_timeout, it's
+    // likely that they should be configured differently for each pool
+
+    static ref CONNECTION_TIMEOUT: Duration = {
+        std::env::var("GRAPH_STORE_CONNECTION_TIMEOUT").ok().map(|s| Duration::from_millis(u64::from_str(&s).unwrap_or_else(|_| {
+            panic!("GRAPH_STORE_CONNECTION_TIMEOUT must be a positive number, but is `{}`", s)
+        }))).unwrap_or(Duration::from_secs(5))
+    };
+    static ref MIN_IDLE: Option<u32> = {
+        std::env::var("GRAPH_STORE_CONNECTION_MIN_IDLE").ok().map(|s| u32::from_str(&s).unwrap_or_else(|_| {
+           panic!("GRAPH_STORE_CONNECTION_MIN_IDLE must be a positive number but is `{}`", s)
+        }))
+    };
+    static ref IDLE_TIMEOUT: Duration = {
+        std::env::var("GRAPH_STORE_CONNECTION_IDLE_TIMEOUT").ok().map(|s| Duration::from_secs(u64::from_str(&s).unwrap_or_else(|_| {
+            panic!("GRAPH_STORE_CONNECTION_IDLE_TIMEOUT must be a positive number, but is `{}`", s)
+        }))).unwrap_or(Duration::from_secs(600))
+    };
+}
 
 pub struct ForeignServer {
     pub name: String,
@@ -46,7 +79,7 @@ pub struct ForeignServer {
 }
 
 impl ForeignServer {
-    pub(crate) const PRIMARY_PUBLIC: &'static str = "primary_public";
+    const PRIMARY_PUBLIC: &'static str = "primary_public";
 
     /// The name of the foreign server under which data for `shard` is
     /// accessible
@@ -175,7 +208,7 @@ impl ForeignServer {
             } else {
                 catalog::create_foreign_table(
                     conn,
-                    NAMESPACE_PUBLIC,
+                    "public",
                     table_name,
                     Self::PRIMARY_PUBLIC,
                     Self::name(&*PRIMARY_SHARD).as_str(),
@@ -197,9 +230,6 @@ impl ForeignServer {
             "subgraph_error",
             "dynamic_ethereum_contract_data_source",
             "table_stats",
-            "subgraph_deployment_assignment",
-            "subgraph",
-            "subgraph_version",
         ] {
             let create_stmt =
                 catalog::create_foreign_table(conn, "subgraphs", table_name, &nsp, &self.name)?;
@@ -214,39 +244,25 @@ impl ForeignServer {
 const FDW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A pool goes through several states, and this enum tracks what state we
-/// are in, together with the `state_tracker` field on `ConnectionPool`.
-/// When first created, the pool is in state `Created`; once we successfully
-/// called `setup` on it, it moves to state `Ready`. During use, we use the
-/// r2d2 callbacks to determine if the database is available or not, and set
-/// the `available` field accordingly. Tracking that allows us to fail fast
-/// and avoids having to wait for a connection timeout every time we need a
-/// database connection. That avoids overall undesirable states like buildup
-/// of queries; instead of queueing them until the database is available,
-/// they return almost immediately with an error
+/// are in. When first created, the pool is in state `Created`; once we
+/// successfully called `setup` on it, it moves to state `Ready`. If we
+/// detect that the database is not available, the pool goes into state
+/// `Unavailable` until we can confirm that we can connect to the database,
+/// at which point it goes back to `Ready`
+// `Unavailable` is not used in the code yet
+#[allow(dead_code)]
 enum PoolState {
     /// A connection pool, and all the servers for which we need to
     /// establish fdw mappings when we call `setup` on the pool
     Created(Arc<PoolInner>, Arc<Vec<ForeignServer>>),
-    /// The pool has been successfully set up
+    Unavailable(Arc<PoolInner>),
     Ready(Arc<PoolInner>),
-    /// The pool has been disabled by setting its size to 0
-    Disabled,
 }
 
 #[derive(Clone)]
 pub struct ConnectionPool {
     inner: Arc<TimedMutex<PoolState>>,
     logger: Logger,
-    pub shard: Shard,
-    state_tracker: PoolStateTracker,
-}
-
-impl fmt::Debug for ConnectionPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionPool")
-            .field("shard", &self.shard)
-            .finish()
-    }
 }
 
 /// The name of the pool, mostly for logging, and what purpose it serves.
@@ -274,31 +290,6 @@ impl PoolName {
     }
 }
 
-#[derive(Clone)]
-struct PoolStateTracker {
-    available: Arc<AtomicBool>,
-}
-
-impl PoolStateTracker {
-    fn new() -> Self {
-        Self {
-            available: Arc::new(AtomicBool::new(true)),
-        }
-    }
-
-    fn mark_available(&self) {
-        self.available.store(true, Ordering::Relaxed);
-    }
-
-    fn mark_unavailable(&self) {
-        self.available.store(false, Ordering::Relaxed);
-    }
-
-    fn is_available(&self) -> bool {
-        self.available.load(Ordering::Relaxed)
-    }
-}
-
 impl ConnectionPool {
     pub fn create(
         shard_name: &str,
@@ -310,35 +301,23 @@ impl ConnectionPool {
         registry: Arc<dyn MetricsRegistry>,
         servers: Arc<Vec<ForeignServer>>,
     ) -> ConnectionPool {
-        let state_tracker = PoolStateTracker::new();
-        let shard =
-            Shard::new(shard_name.to_string()).expect("shard_name is a valid name for a shard");
-        let pool_state = {
-            if pool_size == 0 {
-                PoolState::Disabled
-            } else {
-                let pool = PoolInner::create(
-                    shard.clone(),
-                    pool_name.as_str(),
-                    postgres_url,
-                    pool_size,
-                    fdw_pool_size,
-                    logger,
-                    registry,
-                    state_tracker.clone(),
-                );
-                if pool_name.is_replica() {
-                    PoolState::Ready(Arc::new(pool))
-                } else {
-                    PoolState::Created(Arc::new(pool), servers)
-                }
-            }
+        let pool = PoolInner::create(
+            shard_name,
+            pool_name.as_str(),
+            postgres_url,
+            pool_size,
+            fdw_pool_size,
+            logger,
+            registry,
+        );
+        let pool_state = if pool_name.is_replica() {
+            PoolState::Ready(Arc::new(pool))
+        } else {
+            PoolState::Created(Arc::new(pool), servers)
         };
         ConnectionPool {
             inner: Arc::new(TimedMutex::new(pool_state, format!("pool-{}", shard_name))),
             logger: logger.clone(),
-            shard,
-            state_tracker,
         }
     }
 
@@ -348,7 +327,7 @@ impl ConnectionPool {
         let mut guard = self.inner.lock(&self.logger);
         match &*guard {
             PoolState::Created(pool, _) => *guard = PoolState::Ready(pool.clone()),
-            PoolState::Ready(_) | PoolState::Disabled => { /* nothing to do */ }
+            PoolState::Unavailable(_) | PoolState::Ready(_) => { /* nothing to do */ }
         }
     }
 
@@ -358,25 +337,15 @@ impl ConnectionPool {
     /// `StoreError::DatabaseUnavailable`
     fn get_ready(&self) -> Result<Arc<PoolInner>, StoreError> {
         let mut guard = self.inner.lock(&self.logger);
-        if !self.state_tracker.is_available() && !ENV_VARS.store.connection_try_always {
-            // We know that trying to use this pool is pointless since the
-            // database is not available, and will only lead to other
-            // operations having to wait until the connection timeout is
-            // reached. `TRY_ALWAYS` allows users to force us to try
-            // regardless.
-            return Err(StoreError::DatabaseUnavailable);
-        }
-
         match &*guard {
             PoolState::Created(pool, servers) => {
                 pool.setup(servers.clone())?;
                 let pool2 = pool.clone();
                 *guard = PoolState::Ready(pool.clone());
-                self.state_tracker.mark_available();
                 Ok(pool2)
             }
+            PoolState::Unavailable(_) => Err(StoreError::DatabaseUnavailable),
             PoolState::Ready(pool) => Ok(pool.clone()),
-            PoolState::Disabled => Err(StoreError::DatabaseDisabled),
         }
     }
 
@@ -437,6 +406,13 @@ impl ConnectionPool {
         self.get_ready()?.get()
     }
 
+    pub fn get_with_timeout_warning(
+        &self,
+        logger: &Logger,
+    ) -> Result<PooledConnection<ConnectionManager<PgConnection>>, StoreError> {
+        self.get_ready()?.get_with_timeout_warning(logger)
+    }
+
     /// Get a connection from the pool for foreign data wrapper access;
     /// since that pool can be very contended, periodically log that we are
     /// still waiting for a connection
@@ -472,77 +448,40 @@ impl ConnectionPool {
     /// # Panics
     ///
     /// If any errors happen during the migration, the process panics
-    pub async fn setup(&self) {
-        let pool = self.clone();
-        graph::spawn_blocking_allow_panic(move || {
-            pool.get_ready().ok();
-        })
-        .await
-        // propagate panics
-        .unwrap();
-    }
-
-    pub(crate) async fn query_permit(
-        &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
-        let pool = match &*self.inner.lock(&self.logger) {
-            PoolState::Created(pool, _) | PoolState::Ready(pool) => pool.clone(),
-            PoolState::Disabled => {
-                return Err(StoreError::DatabaseDisabled);
+    pub fn setup(&self) {
+        let mut guard = self.inner.lock(&self.logger);
+        match &*guard {
+            PoolState::Created(pool, servers) => {
+                // If setup errors, we will try again later
+                if pool.setup(servers.clone()).is_ok() {
+                    *guard = PoolState::Ready(pool.clone());
+                }
             }
-        };
-        Ok(pool.query_permit().await)
-    }
-
-    pub(crate) fn wait_stats(&self) -> Result<PoolWaitStats, StoreError> {
-        match &*self.inner.lock(&self.logger) {
-            PoolState::Created(pool, _) | PoolState::Ready(pool) => Ok(pool.wait_stats.clone()),
-            PoolState::Disabled => Err(StoreError::DatabaseDisabled),
+            PoolState::Unavailable(_) | PoolState::Ready(_) => { /* setup was previously done */ }
         }
     }
 
-    /// Mirror key tables from the primary into our own schema. We do this
-    /// by manually inserting or deleting rows through comparing it with the
-    /// table on the primary. Once we drop support for PG 9.6, we can
-    /// simplify all this and achieve the same result with logical
-    /// replication.
-    pub(crate) async fn mirror_primary_tables(&self) -> Result<(), StoreError> {
-        let pool = self.get_ready()?;
-        pool.mirror_primary_tables().await
+    pub(crate) async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let pool = match &*self.inner.lock(&self.logger) {
+            PoolState::Created(pool, _) | PoolState::Unavailable(pool) | PoolState::Ready(pool) => {
+                pool.clone()
+            }
+        };
+        pool.query_permit().await
     }
-}
 
-fn brief_error_msg(error: &dyn std::error::Error) -> String {
-    // For 'Connection refused' errors, Postgres includes the IP and
-    // port number in the error message. We want to suppress that and
-    // only use the first line from the error message. For more detailed
-    // analysis, 'Connection refused' manifests as a
-    // `ConnectionError(BadConnection("could not connect to server:
-    // Connection refused.."))`
-    error
-        .to_string()
-        .split('\n')
-        .next()
-        .unwrap_or("no error details provided")
-        .to_string()
+    pub(crate) fn wait_stats(&self) -> PoolWaitStats {
+        match &*self.inner.lock(&self.logger) {
+            PoolState::Created(pool, _) | PoolState::Unavailable(pool) | PoolState::Ready(pool) => {
+                pool.wait_stats.clone()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
-struct ErrorHandler {
-    logger: Logger,
-    counter: Counter,
-    state_tracker: PoolStateTracker,
-}
+struct ErrorHandler(Logger, Counter);
 
-impl ErrorHandler {
-    fn new(logger: Logger, counter: Counter, state_tracker: PoolStateTracker) -> Self {
-        Self {
-            logger,
-            counter,
-            state_tracker,
-        }
-    }
-}
 impl std::fmt::Debug for ErrorHandler {
     fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Result::Ok(())
@@ -551,31 +490,8 @@ impl std::fmt::Debug for ErrorHandler {
 
 impl r2d2::HandleError<r2d2::Error> for ErrorHandler {
     fn handle_error(&self, error: r2d2::Error) {
-        let msg = brief_error_msg(&error);
-
-        // Don't count canceling statements for timeouts etc. as a
-        // connection error. Unfortunately, we only have the textual error
-        // and need to infer whether the error indicates that the database
-        // is down or if something else happened. When querying a replica,
-        // these messages indicate that a query was canceled because it
-        // conflicted with replication, but does not indicate that there is
-        // a problem with the database itself.
-        //
-        // This check will break if users run Postgres (or even graph-node)
-        // in a locale other than English. In that case, their database will
-        // be marked as unavailable even though it is perfectly fine.
-        if msg.contains("canceling statement")
-            || msg.contains("no connection to the server")
-            || msg.contains("terminating connection due to conflict with recovery")
-        {
-            return;
-        }
-
-        self.counter.inc();
-        if self.state_tracker.is_available() {
-            error!(self.logger, "Postgres connection error"; "error" => msg);
-        }
-        self.state_tracker.mark_unavailable();
+        self.1.inc();
+        error!(self.0, "Postgres connection error"; "error" => error.to_string());
     }
 }
 
@@ -584,9 +500,7 @@ struct EventHandler {
     logger: Logger,
     count_gauge: Gauge,
     wait_gauge: Gauge,
-    size_gauge: Gauge,
     wait_stats: PoolWaitStats,
-    state_tracker: PoolStateTracker,
 }
 
 impl EventHandler {
@@ -595,7 +509,6 @@ impl EventHandler {
         registry: Arc<dyn MetricsRegistry>,
         wait_stats: PoolWaitStats,
         const_labels: HashMap<String, String>,
-        state_tracker: PoolStateTracker,
     ) -> Self {
         let count_gauge = registry
             .global_gauge(
@@ -611,20 +524,11 @@ impl EventHandler {
                 const_labels.clone(),
             )
             .expect("failed to create `store_connection_wait_time_ms` counter");
-        let size_gauge = registry
-            .global_gauge(
-                "store_connection_pool_size_count",
-                "Overall size of the connection pool",
-                const_labels,
-            )
-            .expect("failed to create `store_connection_pool_size_count` counter");
         EventHandler {
             logger,
             count_gauge,
             wait_gauge,
             wait_stats,
-            size_gauge,
-            state_tracker,
         }
     }
 
@@ -643,31 +547,19 @@ impl std::fmt::Debug for EventHandler {
 }
 
 impl HandleEvent for EventHandler {
-    fn handle_acquire(&self, _: e::AcquireEvent) {
-        self.size_gauge.inc();
-        self.state_tracker.mark_available();
-    }
-
-    fn handle_release(&self, _: e::ReleaseEvent) {
-        self.size_gauge.dec();
-    }
-
+    fn handle_acquire(&self, _: e::AcquireEvent) {}
+    fn handle_release(&self, _: e::ReleaseEvent) {}
     fn handle_checkout(&self, event: e::CheckoutEvent) {
         self.count_gauge.inc();
         self.add_conn_wait_time(event.duration());
-        self.state_tracker.mark_available();
     }
-
     fn handle_timeout(&self, event: e::TimeoutEvent) {
         self.add_conn_wait_time(event.timeout());
-        if self.state_tracker.is_available() {
-            error!(self.logger, "Connection checkout timed out";
-               "wait_ms" => event.timeout().as_millis()
-            )
-        }
-        self.state_tracker.mark_unavailable();
+        error!(self.logger, "Connection checkout timed out";
+           "wait_ms" => event.timeout().as_millis(),
+           "backtrace" => format!("{:?}", backtrace::Backtrace::new()),
+        )
     }
-
     fn handle_checkin(&self, _: e::CheckinEvent) {
         self.count_gauge.dec();
     }
@@ -703,74 +595,55 @@ pub struct PoolInner {
 }
 
 impl PoolInner {
-    fn create(
-        shard: Shard,
+    pub fn create(
+        shard_name: &str,
         pool_name: &str,
         postgres_url: String,
         pool_size: u32,
         fdw_pool_size: Option<u32>,
         logger: &Logger,
         registry: Arc<dyn MetricsRegistry>,
-        state_tracker: PoolStateTracker,
     ) -> PoolInner {
         let logger_store = logger.new(o!("component" => "Store"));
         let logger_pool = logger.new(o!("component" => "ConnectionPool"));
         let const_labels = {
             let mut map = HashMap::new();
             map.insert("pool".to_owned(), pool_name.to_owned());
-            map.insert("shard".to_string(), shard.to_string());
+            map.insert("shard".to_string(), shard_name.to_owned());
             map
         };
         let error_counter = registry
             .global_counter(
                 "store_connection_error_count",
                 "The number of Postgres connections errors",
-                const_labels.clone(),
+                HashMap::new(),
             )
             .expect("failed to create `store_connection_error_count` counter");
-        let error_handler = Box::new(ErrorHandler::new(
-            logger_pool.clone(),
-            error_counter,
-            state_tracker.clone(),
-        ));
+        let error_handler = Box::new(ErrorHandler(logger_pool.clone(), error_counter));
         let wait_stats = Arc::new(RwLock::new(MovingStats::default()));
         let event_handler = Box::new(EventHandler::new(
             logger_pool.clone(),
             registry.cheap_clone(),
             wait_stats.clone(),
             const_labels.clone(),
-            state_tracker,
         ));
 
         // Connect to Postgres
         let conn_manager = ConnectionManager::new(postgres_url.clone());
-        let min_idle = ENV_VARS.store.connection_min_idle.filter(|min_idle| {
-            if *min_idle <= pool_size {
-                true
-            } else {
-                warn!(
-                    logger_pool,
-                    "Configuration error: min idle {} exceeds pool size {}, ignoring min idle",
-                    min_idle,
-                    pool_size
-                );
-                false
-            }
-        });
         let builder: Builder<ConnectionManager<PgConnection>> = Pool::builder()
             .error_handler(error_handler.clone())
             .event_handler(event_handler.clone())
-            .connection_timeout(ENV_VARS.store.connection_timeout)
+            .connection_timeout(*CONNECTION_TIMEOUT)
             .max_size(pool_size)
-            .min_idle(min_idle)
-            .idle_timeout(Some(ENV_VARS.store.connection_idle_timeout));
+            .min_idle(*MIN_IDLE)
+            .idle_timeout(Some(*IDLE_TIMEOUT));
         let pool = builder.build_unchecked(conn_manager);
         let fdw_pool = fdw_pool_size.map(|pool_size| {
             let conn_manager = ConnectionManager::new(postgres_url.clone());
             let builder: Builder<ConnectionManager<PgConnection>> = Pool::builder()
                 .error_handler(error_handler)
                 .event_handler(event_handler)
-                .connection_timeout(ENV_VARS.store.connection_timeout)
+                .connection_timeout(*CONNECTION_TIMEOUT)
                 .max_size(pool_size)
                 .min_idle(Some(1))
                 .idle_timeout(Some(FDW_IDLE_TIMEOUT));
@@ -783,16 +656,17 @@ impl PoolInner {
         let semaphore_wait_gauge = registry
             .new_gauge(
                 "query_semaphore_wait_ms",
-                "Moving average of time spent on waiting for postgres query semaphore",
+                "Moving average of time spent running queries",
                 const_labels,
             )
             .expect("failed to create `query_effort_ms` counter");
-        let max_concurrent_queries = pool_size as usize + ENV_VARS.store.extra_query_permits;
+        let max_concurrent_queries = pool_size as usize + *EXTRA_QUERY_PERMITS;
         let query_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_queries));
         PoolInner {
             logger: logger_pool,
-            shard,
-            postgres_url,
+            shard: Shard::new(shard_name.to_string())
+                .expect("shard_name is a valid name for a shard"),
+            postgres_url: postgres_url.clone(),
             pool,
             fdw_pool,
             limiter,
@@ -867,7 +741,7 @@ impl PoolInner {
             // closure failed.
             let conn = pool
                 .get()
-                .map_err(|_| CancelableError::Error(StoreError::DatabaseUnavailable))?;
+                .map_err(|e| CancelableError::Error(StoreError::Unknown(e.into())))?;
 
             // It is possible time has passed while establishing a connection.
             // Time to check for cancel.
@@ -892,7 +766,7 @@ impl PoolInner {
     }
 
     pub fn get(&self) -> Result<PooledConnection<ConnectionManager<PgConnection>>, StoreError> {
-        self.pool.get().map_err(|_| StoreError::DatabaseUnavailable)
+        self.pool.get().map_err(|e| StoreError::Unknown(e.into()))
     }
 
     pub fn get_with_timeout_warning(
@@ -900,10 +774,10 @@ impl PoolInner {
         logger: &Logger,
     ) -> Result<PooledConnection<ConnectionManager<PgConnection>>, StoreError> {
         loop {
-            match self.pool.get_timeout(ENV_VARS.store.connection_timeout) {
+            match self.pool.get_timeout(*CONNECTION_TIMEOUT) {
                 Ok(conn) => return Ok(conn),
                 Err(e) => error!(logger, "Error checking out connection, retrying";
-                   "error" => brief_error_msg(&e),
+                   "error" => e.to_string(),
                 ),
             }
         }
@@ -970,7 +844,7 @@ impl PoolInner {
     /// If any errors happen during the migration, the process panics
     pub fn setup(&self, servers: Arc<Vec<ForeignServer>>) -> Result<(), StoreError> {
         fn die(logger: &Logger, msg: &'static str, err: &dyn std::fmt::Display) -> ! {
-            crit!(logger, "{}", msg; "error" => format!("{:#}", err));
+            crit!(logger, "{}", msg; "error" => err.to_string());
             panic!("{}: {}", msg, err);
         }
 
@@ -1001,7 +875,7 @@ impl PoolInner {
         permit.unwrap()
     }
 
-    fn configure_fdw(&self, servers: &[ForeignServer]) -> Result<(), StoreError> {
+    fn configure_fdw(&self, servers: &Vec<ForeignServer>) -> Result<(), StoreError> {
         info!(&self.logger, "Setting up fdw");
         let conn = self.get()?;
         conn.batch_execute("create extension if not exists postgres_fdw")?;
@@ -1029,24 +903,10 @@ impl PoolInner {
         conn.transaction(|| ForeignServer::map_primary(&conn, &self.shard))
     }
 
-    /// Copy the data from key tables in the primary into our local schema
-    /// so it can be used as a fallback when the primary goes down
-    pub async fn mirror_primary_tables(&self) -> Result<(), StoreError> {
-        if self.shard == *PRIMARY_SHARD {
-            return Ok(());
-        }
-        self.with_conn(|conn, handle| {
-            conn.transaction(|| {
-                primary::Mirror::refresh_tables(conn, handle).map_err(CancelableError::from)
-            })
-        })
-        .await
-    }
-
     // Map some tables from the `subgraphs` metadata schema from foreign
     // servers to ourselves. The mapping is recreated on every server start
     // so that we pick up possible schema changes in the mappings
-    fn map_metadata(&self, servers: &[ForeignServer]) -> Result<(), StoreError> {
+    fn map_metadata(&self, servers: &Vec<ForeignServer>) -> Result<(), StoreError> {
         let conn = self.get()?;
         conn.transaction(|| {
             for server in servers.iter().filter(|server| server.shard != self.shard) {

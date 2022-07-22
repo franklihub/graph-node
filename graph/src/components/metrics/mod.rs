@@ -47,13 +47,6 @@ pub trait MetricsRegistry: Send + Sync + 'static {
         const_labels: HashMap<String, String>,
     ) -> Result<Counter, PrometheusError>;
 
-    fn global_counter_vec(
-        &self,
-        name: &str,
-        help: &str,
-        variable_labels: &[&str],
-    ) -> Result<CounterVec, PrometheusError>;
-
     fn global_deployment_counter(
         &self,
         name: &str,
@@ -63,27 +56,12 @@ pub trait MetricsRegistry: Send + Sync + 'static {
         self.global_counter(name, help, deployment_labels(subgraph))
     }
 
-    fn global_deployment_counter_vec(
-        &self,
-        name: &str,
-        help: &str,
-        subgraph: &str,
-        variable_labels: &[&str],
-    ) -> Result<CounterVec, PrometheusError>;
-
     fn global_gauge(
         &self,
         name: &str,
         help: &str,
         const_labels: HashMap<String, String>,
     ) -> Result<Gauge, PrometheusError>;
-
-    fn global_gauge_vec(
-        &self,
-        name: &str,
-        help: &str,
-        variable_labels: &[&str],
-    ) -> Result<GaugeVec, PrometheusError>;
 
     fn new_gauge(
         &self,
@@ -235,18 +213,6 @@ pub trait MetricsRegistry: Send + Sync + 'static {
         Ok(histogram)
     }
 
-    fn new_histogram(
-        &self,
-        name: &str,
-        help: &str,
-        buckets: Vec<f64>,
-    ) -> Result<Box<Histogram>, PrometheusError> {
-        let opts = HistogramOpts::new(name, help).buckets(buckets);
-        let histogram = Box::new(Histogram::with_opts(opts)?);
-        self.register(name, histogram.clone());
-        Ok(histogram)
-    }
-
     fn new_histogram_vec(
         &self,
         name: &str,
@@ -293,11 +259,4 @@ pub trait MetricsRegistry: Send + Sync + 'static {
         self.register(name, histograms.clone());
         Ok(histograms)
     }
-
-    fn global_histogram_vec(
-        &self,
-        name: &str,
-        help: &str,
-        variable_labels: &[&str],
-    ) -> Result<HistogramVec, PrometheusError>;
 }

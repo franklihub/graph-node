@@ -11,8 +11,6 @@ services:
     depends_on:
       - ipfs
       - postgres
-    extra_hosts:
-      - host.docker.internal:host-gateway
     environment:
       postgres_host: postgres
       postgres_user: graph-node
@@ -22,7 +20,7 @@ services:
       ethereum: 'mainnet:http://host.docker.internal:8545'
       GRAPH_LOG: info
   ipfs:
-    image: ipfs/go-ipfs:v0.10.0
+    image: ipfs/go-ipfs:v0.4.23
     ports:
       - '5001:5001'
     volumes:
@@ -31,15 +29,10 @@ services:
     image: postgres
     ports:
       - '5432:5432'
-    command:
-      [
-        "postgres",
-        "-cshared_preload_libraries=pg_stat_statements"
-      ]
+    command: ["postgres", "-cshared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: graph-node
       POSTGRES_PASSWORD: let-me-in
       POSTGRES_DB: graph-node
-      PGDATA: "/data/postgres"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data

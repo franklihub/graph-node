@@ -1,35 +1,20 @@
 use anyhow::anyhow;
+use stable_hash::prelude::*;
+use stable_hash::utils::AsBytes;
 use std::convert::TryFrom;
+use std::fmt::Write;
 use std::{fmt, str::FromStr};
 use web3::types::{Block, H256};
 
-use crate::data::graphql::IntoValue;
-use crate::object;
-use crate::prelude::{r, BigInt, TryFromValue, ValueMap};
-use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
 use crate::{cheap_clone::CheapClone, components::store::BlockNumber};
 
 /// A simple marker for byte arrays that are really block hashes
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct BlockHash(pub Box<[u8]>);
 
-impl_stable_hash!(BlockHash(transparent: AsBytes));
-
 impl BlockHash {
     pub fn as_slice(&self) -> &[u8] {
         &self.0
-    }
-
-    /// Encodes the block hash into a hexadecimal string **without** a "0x"
-    /// prefix. Hashes are stored in the database in this format when the
-    /// schema uses `text` columns, which is a legacy and such columns
-    /// should be changed to use `bytea`
-    pub fn hash_hex(&self) -> String {
-        hex::encode(&self.0)
-    }
-
-    pub fn zero() -> Self {
-        Self::from(H256::zero())
     }
 }
 
@@ -42,12 +27,6 @@ impl fmt::Display for BlockHash {
 impl fmt::Debug for BlockHash {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "0x{}", hex::encode(&self.0))
-    }
-}
-
-impl fmt::LowerHex for BlockHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&hex::encode(&self.0))
     }
 }
 
@@ -65,25 +44,6 @@ impl From<Vec<u8>> for BlockHash {
     }
 }
 
-impl TryFrom<&str> for BlockHash {
-    type Error = anyhow::Error;
-
-    fn try_from(hash: &str) -> Result<Self, Self::Error> {
-        let hash = hash.trim_start_matches("0x");
-        let hash = hex::decode(hash)?;
-
-        Ok(BlockHash(hash.as_slice().into()))
-    }
-}
-
-impl FromStr for BlockHash {
-    type Err = anyhow::Error;
-
-    fn from_str(hash: &str) -> Result<Self, Self::Err> {
-        Self::try_from(hash)
-    }
-}
-
 /// A block hash and block number from a specific Ethereum block.
 ///
 /// Block numbers are signed 32 bit integers
@@ -95,17 +55,22 @@ pub struct BlockPtr {
 
 impl CheapClone for BlockPtr {}
 
-impl_stable_hash!(BlockPtr { hash, number });
+impl StableHash for BlockPtr {
+    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+        AsBytes(self.hash.0.as_ref()).stable_hash(sequence_number.next_child(), state);
+        self.number.stable_hash(sequence_number.next_child(), state);
+    }
+}
 
 impl BlockPtr {
-    pub fn new(hash: BlockHash, number: BlockNumber) -> Self {
-        Self { hash, number }
-    }
-
     /// Encodes the block hash into a hexadecimal string **without** a "0x" prefix.
     /// Hashes are stored in the database in this format.
     pub fn hash_hex(&self) -> String {
-        self.hash.hash_hex()
+        let mut s = String::with_capacity(self.hash.0.len() * 2);
+        for b in self.hash.0.iter() {
+            write!(s, "{:02x}", b).unwrap();
+        }
+        s
     }
 
     /// Block number to be passed into the store. Panics if it does not fit in an i32.
@@ -113,11 +78,8 @@ impl BlockPtr {
         self.number
     }
 
-    // FIXME:
-    //
-    // workaround for arweave
     pub fn hash_as_h256(&self) -> H256 {
-        H256::from_slice(&self.hash_slice()[..32])
+        H256::from_slice(self.hash_slice())
     }
 
     pub fn hash_slice(&self) -> &[u8] {
@@ -134,17 +96,6 @@ impl fmt::Display for BlockPtr {
 impl fmt::Debug for BlockPtr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "#{} ({})", self.number, self.hash_hex())
-    }
-}
-
-impl slog::Value for BlockPtr {
-    fn serialize(
-        &self,
-        record: &slog::Record,
-        key: slog::Key,
-        serializer: &mut dyn slog::Serializer,
-    ) -> slog::Result {
-        slog::Value::serialize(&self.to_string(), record, key, serializer)
     }
 }
 
@@ -178,16 +129,6 @@ impl From<(H256, i32)> for BlockPtr {
     }
 }
 
-impl From<(Vec<u8>, u64)> for BlockPtr {
-    fn from((bytes, number): (Vec<u8>, u64)) -> Self {
-        let number = i32::try_from(number).unwrap();
-        BlockPtr {
-            hash: BlockHash::from(bytes),
-            number,
-        }
-    }
-}
-
 impl From<(H256, u64)> for BlockPtr {
     fn from((hash, number): (H256, u64)) -> BlockPtr {
         let number = i32::try_from(number).unwrap();
@@ -211,9 +152,10 @@ impl TryFrom<(&str, i64)> for BlockPtr {
 
     fn try_from((hash, number): (&str, i64)) -> Result<Self, Self::Error> {
         let hash = hash.trim_start_matches("0x");
-        let hash = BlockHash::from_str(hash)?;
+        let hash = H256::from_str(hash)
+            .map_err(|e| anyhow!("Cannot parse H256 value from string `{}`: {}", hash, e))?;
 
-        Ok(BlockPtr::new(hash, number as i32))
+        Ok(BlockPtr::from((hash, number)))
     }
 }
 
@@ -225,40 +167,10 @@ impl TryFrom<(&[u8], i64)> for BlockPtr {
             H256::from_slice(bytes)
         } else {
             return Err(anyhow!(
-                "invalid H256 value `{}` has {} bytes instead of {}",
-                hex::encode(bytes),
-                bytes.len(),
-                H256::len_bytes()
+                "invalid H256 value `{}` has {} bytes instead of {}"
             ));
         };
         Ok(BlockPtr::from((hash, number)))
-    }
-}
-
-impl TryFromValue for BlockPtr {
-    fn try_from_value(value: &r::Value) -> Result<Self, anyhow::Error> {
-        match value {
-            r::Value::Object(o) => {
-                let number = o.get_required::<BigInt>("number")?.to_u64() as BlockNumber;
-                let hash = o.get_required::<BlockHash>("hash")?;
-
-                Ok(BlockPtr::new(hash, number))
-            }
-            _ => Err(anyhow!(
-                "failed to parse non-object value into BlockPtr: {:?}",
-                value
-            )),
-        }
-    }
-}
-
-impl IntoValue for BlockPtr {
-    fn into_value(self) -> r::Value {
-        object! {
-            __typename: "Block",
-            hash: self.hash_hex(),
-            number: format!("{}", self.number),
-        }
     }
 }
 
@@ -272,11 +184,4 @@ impl From<BlockPtr> for BlockNumber {
     fn from(ptr: BlockPtr) -> Self {
         ptr.number
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-/// A collection of attributes that (kind of) uniquely identify a blockchain.
-pub struct ChainIdentifier {
-    pub net_version: String,
-    pub genesis_block_hash: BlockHash,
 }

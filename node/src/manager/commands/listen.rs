@@ -1,6 +1,5 @@
-use std::iter::FromIterator;
+use std::io::Write;
 use std::sync::Arc;
-use std::{collections::BTreeSet, io::Write};
 
 use futures::compat::Future01CompatExt;
 //use futures::future;
@@ -8,14 +7,13 @@ use graph::{
     components::store::{EntityType, SubscriptionManager as _},
     prelude::{serde_json, Error, Stream, SubscriptionFilter},
 };
-use graph_store_postgres::connection_pool::ConnectionPool;
 use graph_store_postgres::SubscriptionManager;
 
-use crate::manager::deployment::DeploymentSearch;
+use crate::manager::deployment;
 
 async fn listen(
     mgr: Arc<SubscriptionManager>,
-    filter: BTreeSet<SubscriptionFilter>,
+    filter: Vec<SubscriptionFilter>,
 ) -> Result<(), Error> {
     let events = mgr.subscribe(filter);
     println!("press ctrl-c to stop");
@@ -43,28 +41,23 @@ async fn listen(
 
 pub async fn assignments(mgr: Arc<SubscriptionManager>) -> Result<(), Error> {
     println!("waiting for assignment events");
-    listen(
-        mgr,
-        FromIterator::from_iter([SubscriptionFilter::Assignment]),
-    )
-    .await?;
+    listen(mgr, vec![SubscriptionFilter::Assignment]).await?;
 
     Ok(())
 }
 
 pub async fn entities(
-    primary_pool: ConnectionPool,
     mgr: Arc<SubscriptionManager>,
-    search: &DeploymentSearch,
+    deployment: String,
     entity_types: Vec<String>,
 ) -> Result<(), Error> {
-    let locator = search.locate_unique(&primary_pool)?;
-    let filter = entity_types
+    let deployment = deployment::as_hash(deployment)?;
+    let filter: Vec<_> = entity_types
         .into_iter()
-        .map(|et| SubscriptionFilter::Entities(locator.hash.clone(), EntityType::new(et)))
+        .map(|et| SubscriptionFilter::Entities(deployment.clone(), EntityType::new(et)))
         .collect();
 
-    println!("waiting for store events from {}", locator);
+    println!("waiting for store events from {}", deployment);
     listen(mgr, filter).await?;
 
     Ok(())

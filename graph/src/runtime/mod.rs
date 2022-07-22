@@ -3,12 +3,10 @@
 //! implementation. These methods take types that implement `To`/`FromAscObj` and are therefore
 //! convertible to/from an `AscType`.
 
-pub mod gas;
-
 mod asc_heap;
 mod asc_ptr;
 
-pub use asc_heap::{asc_get, asc_new, AscHeap, FromAscObj, ToAscObj};
+pub use asc_heap::{asc_get, asc_new, try_asc_get, AscHeap, FromAscObj, ToAscObj, TryFromAscObj};
 pub use asc_ptr::AscPtr;
 
 use anyhow::Error;
@@ -16,8 +14,6 @@ use semver::Version;
 use std::convert::TryInto;
 use std::fmt;
 use std::mem::size_of;
-
-use self::gas::GasCounter;
 
 /// Marker trait for AssemblyScript types that the id should
 /// be in the header.
@@ -59,7 +55,6 @@ pub trait AscType: Sized {
     fn asc_size<H: AscHeap + ?Sized>(
         _ptr: AscPtr<Self>,
         _heap: &H,
-        _gas: &GasCounter,
     ) -> Result<u32, DeterministicHostError> {
         Ok(std::mem::size_of::<Self>() as u32)
     }
@@ -76,7 +71,7 @@ impl<T> AscType for std::marker::PhantomData<T> {
         asc_obj: &[u8],
         _api_version: &Version,
     ) -> Result<Self, DeterministicHostError> {
-        assert!(asc_obj.is_empty());
+        assert!(asc_obj.len() == 0);
 
         Ok(Self)
     }
@@ -97,7 +92,7 @@ impl AscType for bool {
         _api_version: &Version,
     ) -> Result<Self, DeterministicHostError> {
         if asc_obj.len() != 1 {
-            Err(DeterministicHostError::from(anyhow::anyhow!(
+            Err(DeterministicHostError(anyhow::anyhow!(
                 "Incorrect size for bool. Expected 1, got {},",
                 asc_obj.len()
             )))
@@ -120,7 +115,7 @@ macro_rules! impl_asc_type {
 
                 fn from_asc_bytes(asc_obj: &[u8], _api_version: &Version) -> Result<Self, DeterministicHostError> {
                     let bytes = asc_obj.try_into().map_err(|_| {
-                        DeterministicHostError::from(anyhow::anyhow!(
+                        DeterministicHostError(anyhow::anyhow!(
                             "Incorrect size for {}. Expected {}, got {},",
                             stringify!($T),
                             size_of::<Self>(),
@@ -139,23 +134,12 @@ macro_rules! impl_asc_type {
 
 impl_asc_type!(u8, u16, u32, u64, i8, i32, i64, f32, f64);
 
-/// Contains type IDs and their discriminants for every blockchain supported by Graph-Node.
-///
-/// Each variant corresponds to the unique ID of an AssemblyScript concrete class used in the
-/// [`runtime`].
-///
-/// # Rules for updating this enum
-///
-/// 1 .The discriminants must have the same value as their counterparts in `TypeId` enum from
-///    graph-ts' `global` module. If not, the runtime will fail to determine the correct class
-///    during allocation.
-/// 2. Each supported blockchain has a reserved space of 1,000 contiguous variants.
-/// 3. Once defined, items and their discriminants cannot be changed, as this would break running
-///    subgraphs compiled in previous versions of this representation.
+// The numbers on each variant could just be comments hence the
+// `#[repr(u32)]`, however having them in code enforces each value
+// to be the same as the docs.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug)]
 pub enum IndexForAscTypeId {
-    // Ethereum type IDs
     String = 0,
     ArrayBuffer = 1,
     Int8Array = 2,
@@ -208,202 +192,23 @@ pub enum IndexForAscTypeId {
     ArrayF32 = 49,
     ArrayF64 = 50,
     ArrayBigDecimal = 51,
-
-    // Near Type IDs
-    NearArrayDataReceiver = 52,
-    NearArrayCryptoHash = 53,
-    NearArrayActionEnum = 54,
-    NearArrayMerklePathItem = 55,
-    NearArrayValidatorStake = 56,
-    NearArraySlashedValidator = 57,
-    NearArraySignature = 58,
-    NearArrayChunkHeader = 59,
-    NearAccessKeyPermissionEnum = 60,
-    NearActionEnum = 61,
-    NearDirectionEnum = 62,
-    NearPublicKey = 63,
-    NearSignature = 64,
-    NearFunctionCallPermission = 65,
-    NearFullAccessPermission = 66,
-    NearAccessKey = 67,
-    NearDataReceiver = 68,
-    NearCreateAccountAction = 69,
-    NearDeployContractAction = 70,
-    NearFunctionCallAction = 71,
-    NearTransferAction = 72,
-    NearStakeAction = 73,
-    NearAddKeyAction = 74,
-    NearDeleteKeyAction = 75,
-    NearDeleteAccountAction = 76,
-    NearActionReceipt = 77,
-    NearSuccessStatusEnum = 78,
-    NearMerklePathItem = 79,
-    NearExecutionOutcome = 80,
-    NearSlashedValidator = 81,
-    NearBlockHeader = 82,
-    NearValidatorStake = 83,
-    NearChunkHeader = 84,
-    NearBlock = 85,
-    NearReceiptWithOutcome = 86,
-    // Reserved discriminant space for more Near type IDs: [87, 999]:
-    // Continue to add more Near type IDs here.
-    // e.g.:
-    // NextNearType = 87,
-    // AnotherNearType = 88,
-    // ...
-    // LastNearType = 999,
-
-    // Reserved discriminant space for more Ethereum type IDs: [1000, 1499]
-    TransactionReceipt = 1000,
-    Log = 1001,
-    ArrayH256 = 1002,
-    ArrayLog = 1003,
-    // Continue to add more Ethereum type IDs here.
-    // e.g.:
-    // NextEthereumType = 1004,
-    // AnotherEthereumType = 1005,
-    // ...
-    // LastEthereumType = 1499,
-
-    // Reserved discriminant space for Cosmos type IDs: [1,500, 2,499]
-    CosmosAny = 1500,
-    CosmosArrayAny = 1501,
-    CosmosArrayBytes = 1502,
-    CosmosArrayCoin = 1503,
-    CosmosArrayCommitSig = 1504,
-    CosmosArrayEvent = 1505,
-    CosmosArrayEventAttribute = 1506,
-    CosmosArrayEvidence = 1507,
-    CosmosArrayModeInfo = 1508,
-    CosmosArraySignerInfo = 1509,
-    CosmosArrayTxResult = 1510,
-    CosmosArrayValidator = 1511,
-    CosmosArrayValidatorUpdate = 1512,
-    CosmosAuthInfo = 1513,
-    CosmosBlock = 1514,
-    CosmosBlockID = 1515,
-    CosmosBlockIDFlagEnum = 1516,
-    CosmosBlockParams = 1517,
-    CosmosCoin = 1518,
-    CosmosCommit = 1519,
-    CosmosCommitSig = 1520,
-    CosmosCompactBitArray = 1521,
-    CosmosConsensus = 1522,
-    CosmosConsensusParams = 1523,
-    CosmosDuplicateVoteEvidence = 1524,
-    CosmosDuration = 1525,
-    CosmosEvent = 1526,
-    CosmosEventAttribute = 1527,
-    CosmosEventData = 1528,
-    CosmosEventVote = 1529,
-    CosmosEvidence = 1530,
-    CosmosEvidenceList = 1531,
-    CosmosEvidenceParams = 1532,
-    CosmosFee = 1533,
-    CosmosHeader = 1534,
-    CosmosHeaderOnlyBlock = 1535,
-    CosmosLightBlock = 1536,
-    CosmosLightClientAttackEvidence = 1537,
-    CosmosModeInfo = 1538,
-    CosmosModeInfoMulti = 1539,
-    CosmosModeInfoSingle = 1540,
-    CosmosPartSetHeader = 1541,
-    CosmosPublicKey = 1542,
-    CosmosResponseBeginBlock = 1543,
-    CosmosResponseDeliverTx = 1544,
-    CosmosResponseEndBlock = 1545,
-    CosmosSignModeEnum = 1546,
-    CosmosSignedHeader = 1547,
-    CosmosSignedMsgTypeEnum = 1548,
-    CosmosSignerInfo = 1549,
-    CosmosTimestamp = 1550,
-    CosmosTip = 1551,
-    CosmosTransactionData = 1552,
-    CosmosTx = 1553,
-    CosmosTxBody = 1554,
-    CosmosTxResult = 1555,
-    CosmosValidator = 1556,
-    CosmosValidatorParams = 1557,
-    CosmosValidatorSet = 1558,
-    CosmosValidatorSetUpdates = 1559,
-    CosmosValidatorUpdate = 1560,
-    CosmosVersionParams = 1561,
-    // Continue to add more Cosmos type IDs here.
-    // e.g.:
-    // NextCosmosType = 1562,
-    // AnotherCosmosType = 1563,
-    // ...
-    // LastCosmosType = 2499,
-
-    // Arweave types
-    ArweaveBlock = 2500,
-    ArweaveProofOfAccess = 2501,
-    ArweaveTag = 2502,
-    ArweaveTagArray = 2503,
-    ArweaveTransaction = 2504,
-    ArweaveTransactionArray = 2505,
-    ArweaveTransactionWithBlockPtr = 2506,
-    // Continue to add more Arweave type IDs here.
-    // e.g.:
-    // NextArweaveType = 2507,
-    // AnotherArweaveType = 2508,
-    // ...
-    // LastArweaveType = 3499,
-
-    // Reserved discriminant space for a future blockchain type IDs: [3,500, 4,499]
-    //
-    // Generated with the following shell script:
-    //
-    // ```
-    // grep -Po "(?<=IndexForAscTypeId::)IDENDIFIER_PREFIX.*\b" SRC_FILE | sort |uniq | awk 'BEGIN{count=2500} {sub("$", " = "count",", $1); count++} 1'
-    // ```
-    //
-    // INSTRUCTIONS:
-    // 1. Replace the IDENTIFIER_PREFIX and the SRC_FILE placeholders according to the blockchain
-    //    name and implementation before running this script.
-    // 2. Replace `3500` part with the first number of that blockchain's reserved discriminant space.
-    // 3. Insert the output right before the end of this block.
 }
 
 impl ToAscObj<u32> for IndexForAscTypeId {
     fn to_asc_obj<H: AscHeap + ?Sized>(
         &self,
         _heap: &mut H,
-        _gas: &GasCounter,
     ) -> Result<u32, DeterministicHostError> {
         Ok(*self as u32)
     }
 }
 
 #[derive(Debug)]
-pub enum DeterministicHostError {
-    Gas(Error),
-    Other(Error),
-}
-
-impl DeterministicHostError {
-    pub fn gas(e: Error) -> Self {
-        DeterministicHostError::Gas(e)
-    }
-
-    pub fn inner(self) -> Error {
-        match self {
-            DeterministicHostError::Gas(e) | DeterministicHostError::Other(e) => e,
-        }
-    }
-}
+pub struct DeterministicHostError(pub Error);
 
 impl fmt::Display for DeterministicHostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DeterministicHostError::Gas(e) | DeterministicHostError::Other(e) => e.fmt(f),
-        }
-    }
-}
-
-impl From<Error> for DeterministicHostError {
-    fn from(e: Error) -> DeterministicHostError {
-        DeterministicHostError::Other(e)
+        self.0.fmt(f)
     }
 }
 
@@ -429,11 +234,7 @@ impl From<anyhow::Error> for HostExportError {
 
 impl From<DeterministicHostError> for HostExportError {
     fn from(value: DeterministicHostError) -> Self {
-        match value {
-            // Until we are confident on the gas numbers, gas errors are not deterministic
-            DeterministicHostError::Gas(e) => HostExportError::Unknown(e),
-            DeterministicHostError::Other(e) => HostExportError::Deterministic(e),
-        }
+        HostExportError::Deterministic(value.0)
     }
 }
 

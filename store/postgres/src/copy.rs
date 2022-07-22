@@ -39,12 +39,7 @@ use crate::{
 use crate::{connection_pool::ConnectionPool, relational::Layout};
 use crate::{relational::Table, relational_queries as rq};
 
-/// The initial batch size for tables that do not have an array column
 const INITIAL_BATCH_SIZE: i64 = 10_000;
-/// The initial batch size for tables that do have an array column; those
-/// arrays can be large and large arrays will slow down copying a lot. We
-/// therefore tread lightly in that case
-const INITIAL_BATCH_SIZE_LIST: i64 = 100;
 const TARGET_DURATION: Duration = Duration::from_secs(5 * 60);
 const LOG_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
@@ -184,7 +179,7 @@ impl CopyState {
             ))
             .execute(conn)?;
 
-        let mut tables: Vec<_> = dst
+        let tables: Vec<_> = dst
             .tables
             .values()
             .filter_map(|dst_table| {
@@ -201,7 +196,6 @@ impl CopyState {
                     })
             })
             .collect::<Result<_, _>>()?;
-        tables.sort_by_key(|table| table.dst.object.to_string());
 
         let values = tables
             .iter()
@@ -292,15 +286,9 @@ impl TableState {
             max_vid: i64,
         }
 
-        let max_block_clause = if src.immutable {
-            "block$ <= $1"
-        } else {
-            "lower(block_range) <= $1"
-        };
         let target_vid = sql_query(&format!(
-            "select coalesce(max(vid), -1) as max_vid from {} where {}",
-            src.qualified_name.as_str(),
-            max_block_clause
+            "select coalesce(max(vid), -1) as max_vid from {} where lower(block_range) <= $1",
+            src.qualified_name.as_str()
         ))
         .bind::<Integer, _>(&target_block.number)
         .load::<MaxVid>(conn)?
@@ -308,19 +296,13 @@ impl TableState {
         .map(|v| v.max_vid)
         .unwrap_or(-1);
 
-        let batch_size = if dst.columns.iter().any(|col| col.is_list()) {
-            INITIAL_BATCH_SIZE_LIST
-        } else {
-            INITIAL_BATCH_SIZE
-        };
-
         Ok(Self {
             dst_site,
             src,
             dst,
             next_vid: 0,
             target_vid,
-            batch_size,
+            batch_size: INITIAL_BATCH_SIZE,
             duration_ms: 0,
         })
     }
@@ -344,7 +326,7 @@ impl TableState {
             id: i32,
         ) -> Result<Arc<Table>, StoreError> {
             layout
-                .table_for_entity(entity_type)
+                .table_for_entity(&entity_type)
                 .map_err(|e| {
                     constraint_violation!(
                         "invalid {} table {} in CopyState {} (table {}): {}",
@@ -368,7 +350,6 @@ impl TableState {
                 cts::batch_size,
                 cts::duration_ms,
             ))
-            .order_by(cts::entity_type)
             .load::<(i32, String, i64, i64, i64, i64)>(conn)?
             .into_iter()
             .map(

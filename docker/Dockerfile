@@ -14,7 +14,6 @@ ARG TAG_NAME=unknown
 ADD . /graph-node
 
 RUN cd /graph-node \
-    && apt-get update && apt-get install -y cmake \
     && rustup component add rustfmt \
     && RUSTFLAGS="-g" cargo install --locked --path node \
     && cargo clean \
@@ -32,12 +31,17 @@ RUN cd /graph-node \
 
 # The graph-node runtime image with only the executable
 FROM debian:buster-slim as graph-node
+# allowlist.json filepath
+ENV SUBGRAPH_ALLOWEDLIST_FILEPATH ""
+
 ENV RUST_LOG ""
 ENV GRAPH_LOG ""
 ENV EARLY_LOG_CHUNK_SIZE ""
 ENV ETHEREUM_RPC_PARALLEL_REQUESTS ""
 ENV ETHEREUM_BLOCK_CHUNK_SIZE ""
 
+ENV disable_subgraph false
+ENV disable_block_ingestor false
 ENV postgres_host ""
 ENV postgres_user ""
 ENV postgres_pass ""
@@ -59,7 +63,7 @@ ENV ethereum_polling_interval ""
 # described in ../docs/config.md
 # Using a configuration file is experimental, and the file format may
 # change in backwards-incompatible ways
-ENV GRAPH_NODE_CONFIG ""
+# ENV GRAPH_NODE_CONFIG ""
 
 # Disable core dumps; this is useful for query nodes with large caches. Set
 # this to anything to disable coredumps (via 'ulimit -c 0')
@@ -81,6 +85,7 @@ ADD docker/wait_for docker/start /usr/local/bin/
 COPY --from=graph-node-build /usr/local/cargo/bin/graph-node /usr/local/cargo/bin/graphman /usr/local/bin/
 COPY --from=graph-node-build /etc/image-info /etc/image-info
 COPY docker/Dockerfile /Dockerfile
+COPY allowlist.json /allowlist.json
 CMD start
 
 # Debug image to access core dumps

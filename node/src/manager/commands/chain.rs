@@ -1,25 +1,18 @@
 use std::sync::Arc;
 
 use graph::blockchain::BlockPtr;
-use graph::cheap_clone::CheapClone;
 use graph::prelude::BlockNumber;
 use graph::prelude::ChainStore as _;
-use graph::prelude::EthereumBlock;
 use graph::prelude::LightEthereumBlockExt as _;
 use graph::prelude::{anyhow, anyhow::bail};
-use graph::{
-    components::store::BlockStore as _, prelude::anyhow::Error, prelude::serde_json as json,
-};
+use graph::{components::store::BlockStore as _, prelude::anyhow::Error};
 use graph_store_postgres::BlockStore;
 use graph_store_postgres::{
     command_support::catalog::block_store, connection_pool::ConnectionPool,
 };
 
-pub async fn list(primary: ConnectionPool, store: Arc<BlockStore>) -> Result<(), Error> {
-    let mut chains = {
-        let conn = primary.get()?;
-        block_store::load_chains(&conn)?
-    };
+pub fn list(primary: ConnectionPool, store: Arc<BlockStore>) -> Result<(), Error> {
+    let mut chains = block_store::load_chains(&primary)?;
     chains.sort_by_key(|chain| chain.name.clone());
 
     if !chains.is_empty() {
@@ -36,8 +29,7 @@ pub async fn list(primary: ConnectionPool, store: Arc<BlockStore>) -> Result<(),
         let head_block = match store.chain_store(&chain.name) {
             None => "no chain".to_string(),
             Some(chain_store) => chain_store
-                .chain_head_ptr()
-                .await?
+                .chain_head_ptr()?
                 .map(|ptr| ptr.number.to_string())
                 .unwrap_or("none".to_string()),
         };
@@ -49,7 +41,7 @@ pub async fn list(primary: ConnectionPool, store: Arc<BlockStore>) -> Result<(),
     Ok(())
 }
 
-pub async fn info(
+pub fn info(
     primary: ConnectionPool,
     store: Arc<BlockStore>,
     name: String,
@@ -82,14 +74,11 @@ pub async fn info(
     let chain_store = store
         .chain_store(&chain.name)
         .ok_or_else(|| anyhow!("unknown chain: {}", name))?;
-    let head_block = chain_store.cheap_clone().chain_head_ptr().await?;
+    let head_block = chain_store.chain_head_ptr()?;
     let ancestor = match &head_block {
         None => None,
         Some(head_block) => chain_store
-            .ancestor_block(head_block.clone(), offset)
-            .await?
-            .map(json::from_value::<EthereumBlock>)
-            .transpose()?
+            .ancestor_block(head_block.clone(), offset)?
             .map(|b| b.block.block_ptr()),
     };
 

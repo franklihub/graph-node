@@ -2,27 +2,22 @@ use std::{
     collections::{HashMap, HashSet},
     iter::FromIterator,
     sync::{Arc, RwLock},
-    time::Duration,
 };
 
+use graph::prelude::{tokio, StoreError};
 use graph::{
-    blockchain::ChainIdentifier,
     components::store::BlockStore as BlockStoreTrait,
-    prelude::{error, warn, BlockNumber, BlockPtr, Logger},
+    prelude::{error, warn, BlockNumber, BlockPtr, EthereumNetworkIdentifier, Logger},
 };
 use graph::{
     constraint_violation,
     prelude::{anyhow, CheapClone},
 };
-use graph::{
-    prelude::{tokio, StoreError},
-    util::timed_cache::TimedCache,
-};
 
 use crate::{
-    chain_head_listener::ChainHeadUpdateSender, connection_pool::ConnectionPool,
-    primary::Mirror as PrimaryMirror, ChainStore, NotificationSender, Shard, PRIMARY_SHARD,
+    chain_head_listener::ChainHeadUpdateSender, connection_pool::ConnectionPool, ChainStore,
 };
+use crate::{subgraph_store::PRIMARY_SHARD, Shard};
 
 #[cfg(debug_assertions)]
 pub const FAKE_NETWORK_SHARED: &str = "fake_network_shared";
@@ -36,16 +31,15 @@ pub enum ChainStatus {
 }
 
 pub mod primary {
-    use std::convert::TryFrom;
+    use std::str::FromStr;
 
     use diesel::{
         delete, insert_into, ExpressionMethods, OptionalExtension, PgConnection, QueryDsl,
         RunQueryDsl,
     };
     use graph::{
-        blockchain::{BlockHash, ChainIdentifier},
         constraint_violation,
-        prelude::StoreError,
+        prelude::{web3::types::H256, EthereumNetworkIdentifier, StoreError},
     };
 
     use crate::chain_store::Storage;
@@ -76,25 +70,24 @@ pub mod primary {
     }
 
     impl Chain {
-        pub fn network_identifier(&self) -> Result<ChainIdentifier, StoreError> {
-            Ok(ChainIdentifier {
+        pub fn network_identifier(&self) -> Result<EthereumNetworkIdentifier, StoreError> {
+            Ok(EthereumNetworkIdentifier {
                 net_version: self.net_version.clone(),
-                genesis_block_hash: BlockHash::try_from(self.genesis_block.as_str()).map_err(
-                    |e| {
-                        constraint_violation!(
-                            "the genesis block hash `{}` for chain `{}` is not a valid hash: {}",
-                            self.genesis_block,
-                            self.name,
-                            e
-                        )
-                    },
-                )?,
+                genesis_block_hash: H256::from_str(&self.genesis_block).map_err(|e| {
+                    constraint_violation!(
+                        "the genesis block hash `{}` for chain `{}` is not a valid hash: {}",
+                        self.genesis_block,
+                        self.name,
+                        e
+                    )
+                })?,
             })
         }
     }
 
-    pub fn load_chains(conn: &PgConnection) -> Result<Vec<Chain>, StoreError> {
-        Ok(chains::table.load(conn)?)
+    pub fn load_chains(pool: &ConnectionPool) -> Result<Vec<Chain>, StoreError> {
+        let conn = pool.get()?;
+        Ok(chains::table.load(&conn)?)
     }
 
     pub fn find_chain(conn: &PgConnection, name: &str) -> Result<Option<Chain>, StoreError> {
@@ -107,7 +100,7 @@ pub mod primary {
     pub fn add_chain(
         pool: &ConnectionPool,
         name: &str,
-        ident: &ChainIdentifier,
+        ident: &EthereumNetworkIdentifier,
         shard: &Shard,
     ) -> Result<Chain, StoreError> {
         let conn = pool.get()?;
@@ -121,7 +114,7 @@ pub mod primary {
                     chains::name.eq(name),
                     chains::namespace.eq("public"),
                     chains::net_version.eq(&ident.net_version),
-                    chains::genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
+                    chains::genesis_block_hash.eq(format!("{:x}", &ident.genesis_block_hash)),
                     chains::shard.eq(shard.as_str()),
                 ))
                 .returning(chains::namespace)
@@ -134,7 +127,7 @@ pub mod primary {
             .values((
                 chains::name.eq(name),
                 chains::net_version.eq(&ident.net_version),
-                chains::genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
+                chains::genesis_block_hash.eq(format!("{:x}", &ident.genesis_block_hash)),
                 chains::shard.eq(shard.as_str()),
             ))
             .returning(chains::namespace)
@@ -180,9 +173,7 @@ pub struct BlockStore {
     /// previous state in the database.
     stores: RwLock<HashMap<String, Arc<ChainStore>>>,
     pools: HashMap<Shard, ConnectionPool>,
-    sender: Arc<NotificationSender>,
-    mirror: PrimaryMirror,
-    chain_head_cache: TimedCache<String, HashMap<String, BlockPtr>>,
+    primary: ConnectionPool,
 }
 
 impl BlockStore {
@@ -200,33 +191,29 @@ impl BlockStore {
     pub fn new(
         logger: Logger,
         // (network, ident, shard)
-        chains: Vec<(String, Vec<ChainIdentifier>, Shard)>,
+        chains: Vec<(String, Vec<EthereumNetworkIdentifier>, Shard)>,
         // shard -> pool
         pools: HashMap<Shard, ConnectionPool>,
-        sender: Arc<NotificationSender>,
     ) -> Result<Self, StoreError> {
-        // Cache chain head pointers for this long when returning
-        // information from `chain_head_pointers`
-        const CHAIN_HEAD_CACHE_TTL: Duration = Duration::from_secs(2);
-
-        let mirror = PrimaryMirror::new(&pools);
-        let existing_chains = mirror.read(|conn| primary::load_chains(conn))?;
-        let chain_head_cache = TimedCache::new(CHAIN_HEAD_CACHE_TTL);
+        let primary = pools
+            .get(&PRIMARY_SHARD)
+            .expect("we always have a primary pool")
+            .clone();
+        let existing_chains = primary::load_chains(&primary)?;
 
         let block_store = Self {
             logger,
             stores: RwLock::new(HashMap::new()),
             pools,
-            sender,
-            mirror,
-            chain_head_cache,
+            primary,
         };
 
         fn reduce_idents(
             chain_name: &str,
-            idents: Vec<ChainIdentifier>,
-        ) -> Result<Option<ChainIdentifier>, StoreError> {
-            let mut idents: HashSet<ChainIdentifier> = HashSet::from_iter(idents.into_iter());
+            idents: Vec<EthereumNetworkIdentifier>,
+        ) -> Result<Option<EthereumNetworkIdentifier>, StoreError> {
+            let mut idents: HashSet<EthereumNetworkIdentifier> =
+                HashSet::from_iter(idents.into_iter());
             match idents.len() {
                 0 => Ok(None),
                 1 => Ok(idents.drain().next()),
@@ -245,7 +232,7 @@ impl BlockStore {
             logger: &Logger,
             chain: &primary::Chain,
             shard: &Shard,
-            ident: &Option<ChainIdentifier>,
+            ident: &Option<EthereumNetworkIdentifier>,
         ) -> bool {
             if &chain.shard != shard {
                 error!(
@@ -268,9 +255,9 @@ impl BlockStore {
                     );
                         return false;
                     }
-                    if chain.genesis_block != ident.genesis_block_hash.hash_hex() {
+                    if &chain.genesis_block != &format!("{:x}", ident.genesis_block_hash) {
                         error!(logger,
-                        "the genesis block hash for chain {} has changed from {} to {} since the last time we ran",
+                        "the genesis block hash for chain {} has changed from {} to {:x} since the last time we ran",
                         chain.name,
                         chain.genesis_block,
                         ident.genesis_block_hash
@@ -301,15 +288,11 @@ impl BlockStore {
                     } else {
                         ChainStatus::ReadOnly
                     };
-                    block_store.add_chain_store(chain, status, false)?;
+                    block_store.add_chain_store(&chain, status, false)?;
                 }
                 (None, Some(ident)) => {
-                    let chain = primary::add_chain(
-                        block_store.mirror.primary(),
-                        &chain_name,
-                        &ident,
-                        &shard,
-                    )?;
+                    let chain =
+                        primary::add_chain(&block_store.primary, &chain_name, &ident, &shard)?;
                     block_store.add_chain_store(&chain, ChainStatus::Ingestible, true)?;
                 }
                 (None, None) => {
@@ -335,17 +318,13 @@ impl BlockStore {
             .iter()
             .filter(|chain| !configured_chains.contains(&chain.name))
         {
-            block_store.add_chain_store(chain, ChainStatus::ReadOnly, false)?;
+            block_store.add_chain_store(&chain, ChainStatus::ReadOnly, false)?;
         }
         Ok(block_store)
     }
 
     pub(crate) async fn query_permit_primary(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.mirror
-            .primary()
-            .query_permit()
-            .await
-            .expect("the primary is never disabled")
+        self.primary.query_permit().await
     }
 
     fn add_chain_store(
@@ -359,11 +338,7 @@ impl BlockStore {
             .get(&chain.shard)
             .ok_or_else(|| constraint_violation!("there is no pool for shard {}", chain.shard))?
             .clone();
-        let sender = ChainHeadUpdateSender::new(
-            self.mirror.primary().clone(),
-            chain.name.clone(),
-            self.sender.clone(),
-        );
+        let sender = ChainHeadUpdateSender::new(self.primary.clone(), chain.name.clone());
         let ident = chain.network_identifier()?;
         let store = ChainStore::new(
             chain.name.clone(),
@@ -384,30 +359,17 @@ impl BlockStore {
         Ok(store)
     }
 
-    /// Return a map from network name to the network's chain head pointer.
-    /// The information is cached briefly since this method is used heavily
-    /// by the indexing status API
     pub fn chain_head_pointers(&self) -> Result<HashMap<String, BlockPtr>, StoreError> {
         let mut map = HashMap::new();
-        for (shard, pool) in &self.pools {
-            let cached = match self.chain_head_cache.get(shard.as_str()) {
-                Some(cached) => cached,
-                None => {
-                    let conn = match pool.get() {
-                        Ok(conn) => conn,
-                        Err(StoreError::DatabaseUnavailable) => continue,
-                        Err(e) => return Err(e),
-                    };
-                    let heads = Arc::new(ChainStore::chain_head_pointers(&conn)?);
-                    self.chain_head_cache.set(shard.to_string(), heads.clone());
-                    heads
-                }
-            };
-            map.extend(
-                cached
-                    .iter()
-                    .map(|(chain, ptr)| (chain.clone(), ptr.clone())),
-            );
+        let stores = self
+            .stores
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for store in stores {
+            map.extend(store.chain_head_pointers()?);
         }
         Ok(map)
     }
@@ -419,16 +381,13 @@ impl BlockStore {
         store.chain_head_block(chain)
     }
 
-    fn lookup_chain<'a>(&'a self, chain: &'a str) -> Result<Option<Arc<ChainStore>>, StoreError> {
+    fn lookup_chain(&self, chain: &str) -> Result<Option<Arc<ChainStore>>, StoreError> {
         // See if we have that chain in the database even if it wasn't one
         // of the configured chains
-        self.mirror.read(|conn| {
-            primary::find_chain(conn, chain).and_then(|chain| {
-                chain
-                    .map(|chain| self.add_chain_store(&chain, ChainStatus::ReadOnly, false))
-                    .transpose()
-            })
-        })
+        let conn = self.primary.get()?;
+        primary::find_chain(&conn, chain)?
+            .map(|chain| self.add_chain_store(&chain, ChainStatus::ReadOnly, false))
+            .transpose()
     }
 
     fn store(&self, chain: &str) -> Option<Arc<ChainStore>> {
@@ -458,35 +417,12 @@ impl BlockStore {
 
         // Delete from the primary first since that's where
         // deployment_schemas has a fk constraint on chains
-        primary::drop_chain(self.mirror.primary(), chain)?;
+        primary::drop_chain(&self.primary, chain)?;
 
         chain_store.drop_chain()?;
 
         self.stores.write().unwrap().remove(chain);
 
-        Ok(())
-    }
-
-    fn truncate_block_caches(&self) -> Result<(), StoreError> {
-        for store in self.stores.read().unwrap().values() {
-            store.truncate_block_cache()?
-        }
-        Ok(())
-    }
-
-    pub fn update_db_version(&self) -> Result<(), StoreError> {
-        use crate::primary::db_version as dbv;
-        use diesel::prelude::*;
-
-        let primary_pool = self.pools.get(&*PRIMARY_SHARD).unwrap();
-        let connection = primary_pool.get()?;
-        let version: i64 = dbv::table.select(dbv::version).get_result(&connection)?;
-        if version < 3 {
-            self.truncate_block_caches()?;
-            diesel::update(dbv::table)
-                .set(dbv::version.eq(3))
-                .execute(&connection)?;
-        };
         Ok(())
     }
 }

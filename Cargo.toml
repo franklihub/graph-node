@@ -13,14 +13,24 @@ members = [
     "server/index-node",
     "server/metrics",
     "store/postgres",
-    "store/test-store",
+    # "store/test-store",
     "graph",
-    "tests",
+    # "tests",
 ]
 
-# Incremental compilation on Rust 1.58 causes an ICE on build. As soon as graph node builds again, these can be removed.
+
+[patch.crates-io]
+# Include protection against stack overflow when parsing from this PR: https://github.com/graphql-rust/graphql-parser/commit/45167b53e9533c331298683577ba8df7e43480ac
+graphql-parser = {git="https://github.com/graphql-rust/graphql-parser", rev="45167b53e9533c331298683577ba8df7e43480ac"}
+
+# Incremental compilation on Rust 1.55 causes an ICE on build. As soon as graph node builds again, these can be removed.
+[profile.dev]
+incremental = false
 [profile.test]
 incremental = false
 
-[profile.dev]
-incremental = false
+# [package]
+# name = "relation-node"
+# version = "0.0.1"
+# authors = ["An Devloper <an.devloper@example.com>"]
+# default-run = "target/debug/relation-node"

@@ -1,12 +1,15 @@
 use super::error::{QueryError, QueryExecutionError};
-use crate::data::value::Object;
-use crate::prelude::{r, CacheWeight, DeploymentHash};
+use crate::{
+    data::graphql::SerializableValue,
+    prelude::{q, CacheWeight, DeploymentHash},
+};
 use http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     CONTENT_TYPE,
 };
 use serde::ser::*;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
@@ -18,7 +21,7 @@ where
 
     // Unwrap: data is only serialized if it is `Some`.
     for (k, v) in data.as_ref().unwrap() {
-        ser.serialize_entry(k, v)?;
+        ser.serialize_entry(k, &SerializableValue(v))?;
     }
     ser.end()
 }
@@ -33,13 +36,13 @@ where
     let mut ser = serializer.serialize_map(None)?;
     for map in data {
         for (k, v) in map {
-            ser.serialize_entry(k, v)?;
+            ser.serialize_entry(k, &SerializableValue(v))?;
         }
     }
     ser.end()
 }
 
-pub type Data = Object;
+pub type Data = BTreeMap<String, q::Value>;
 
 #[derive(Debug)]
 /// A collection of query results that is serialized as a single result.
@@ -56,21 +59,6 @@ impl QueryResults {
 
     pub fn first(&self) -> Option<&Arc<QueryResult>> {
         self.results.first()
-    }
-
-    pub fn has_errors(&self) -> bool {
-        self.results.iter().any(|result| result.has_errors())
-    }
-
-    pub fn not_found(&self) -> bool {
-        self.results.iter().any(|result| result.not_found())
-    }
-
-    pub fn deployment_hash(&self) -> Option<&DeploymentHash> {
-        self.results
-            .iter()
-            .filter_map(|result| result.deployment.as_ref())
-            .next()
     }
 }
 
@@ -178,17 +166,13 @@ impl QueryResults {
             .header(ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, User-Agent")
             .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS, POST")
             .header(CONTENT_TYPE, "application/json")
-            .header(
-                "Graph-Attestable",
-                self.results.iter().all(|r| r.is_attestable()).to_string(),
-            )
             .body(T::from(json))
             .unwrap()
     }
 }
 
 /// The result of running a query, if successful.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct QueryResult {
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -226,28 +210,15 @@ impl QueryResult {
         !self.errors.is_empty()
     }
 
-    pub fn not_found(&self) -> bool {
-        self.errors.iter().any(|e| {
-            matches!(
-                e,
-                QueryError::ExecutionError(QueryExecutionError::DeploymentNotFound(_))
-            )
-        })
-    }
-
     pub fn has_data(&self) -> bool {
         self.data.is_some()
     }
 
-    pub fn is_attestable(&self) -> bool {
-        self.errors.iter().all(|err| err.is_attestable())
-    }
-
-    pub fn to_result(self) -> Result<Option<r::Value>, Vec<QueryError>> {
+    pub fn to_result(self) -> Result<Option<q::Value>, Vec<QueryError>> {
         if self.has_errors() {
             Err(self.errors)
         } else {
-            Ok(self.data.map(r::Value::Object))
+            Ok(self.data.map(q::Value::Object))
         }
     }
 
@@ -261,10 +232,6 @@ impl QueryResult {
 
     pub fn errors_mut(&mut self) -> &mut Vec<QueryError> {
         &mut self.errors
-    }
-
-    pub fn data(&self) -> Option<&Data> {
-        self.data.as_ref()
     }
 }
 
@@ -298,18 +265,18 @@ impl From<Vec<QueryExecutionError>> for QueryResult {
     }
 }
 
-impl From<Object> for QueryResult {
-    fn from(val: Object) -> Self {
+impl From<Data> for QueryResult {
+    fn from(val: Data) -> Self {
         QueryResult::new(val)
     }
 }
 
-impl TryFrom<r::Value> for QueryResult {
+impl TryFrom<q::Value> for QueryResult {
     type Error = &'static str;
 
-    fn try_from(value: r::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: q::Value) -> Result<Self, Self::Error> {
         match value {
-            r::Value::Object(map) => Ok(QueryResult::from(map)),
+            q::Value::Object(map) => Ok(QueryResult::from(map)),
             _ => Err("only objects can be turned into a QueryResult"),
         }
     }
@@ -337,8 +304,9 @@ fn multiple_data_items() {
     use serde_json::json;
 
     fn make_obj(key: &str, value: &str) -> Arc<QueryResult> {
-        let obj = Object::from_iter([(key.to_owned(), r::Value::String(value.to_owned()))]);
-        Arc::new(obj.into())
+        let mut map = BTreeMap::new();
+        map.insert(key.to_owned(), q::Value::String(value.to_owned()));
+        Arc::new(map.into())
     }
 
     let obj1 = make_obj("key1", "value1");

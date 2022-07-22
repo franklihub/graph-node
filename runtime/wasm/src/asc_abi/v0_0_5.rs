@@ -1,14 +1,10 @@
-use std::marker::PhantomData;
-use std::mem::{size_of, size_of_val};
-
+use crate::asc_abi::class;
 use anyhow::anyhow;
-use semver::Version;
-
-use graph::runtime::gas::GasCounter;
 use graph::runtime::{AscHeap, AscPtr, AscType, AscValue, DeterministicHostError, HEADER_SIZE};
 use graph_runtime_derive::AscType;
-
-use crate::asc_abi::class;
+use semver::Version;
+use std::marker::PhantomData;
+use std::mem::{size_of, size_of_val};
 
 /// Module related to AssemblyScript version >=v0.19.2.
 /// All `to_asc_bytes`/`from_asc_bytes` only consider the #data/content/payload
@@ -33,7 +29,7 @@ impl ArrayBuffer {
         }
 
         if content.len() > u32::max_value() as usize {
-            return Err(DeterministicHostError::from(anyhow::anyhow!(
+            return Err(DeterministicHostError(anyhow::anyhow!(
                 "slice cannot fit in WASM memory"
             )));
         }
@@ -115,11 +111,10 @@ impl<T: AscValue> TypedArray<T> {
     pub(crate) fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
-        gas: &GasCounter,
     ) -> Result<Self, DeterministicHostError> {
         let buffer = class::ArrayBuffer::new(content, heap.api_version())?;
         let byte_length = content.len() as u32;
-        let ptr = AscPtr::alloc_obj(buffer, heap, gas)?;
+        let ptr = AscPtr::alloc_obj(buffer, heap)?;
         Ok(TypedArray {
             buffer: AscPtr::new(ptr.wasm_ptr()), // new AscPtr necessary to convert type parameter
             data_start: ptr.wasm_ptr(),
@@ -131,7 +126,6 @@ impl<T: AscValue> TypedArray<T> {
     pub(crate) fn to_vec<H: AscHeap + ?Sized>(
         &self,
         heap: &H,
-        gas: &GasCounter,
     ) -> Result<Vec<T>, DeterministicHostError> {
         // We're trying to read the pointer below, we should check it's
         // not null before using it.
@@ -147,13 +141,13 @@ impl<T: AscValue> TypedArray<T> {
             .data_start
             .checked_sub(self.buffer.wasm_ptr())
             .ok_or_else(|| {
-                DeterministicHostError::from(anyhow::anyhow!(
+                DeterministicHostError(anyhow::anyhow!(
                     "Subtract overflow on pointer: {}",
                     self.data_start
                 ))
             })?;
 
-        self.buffer.read_ptr(heap, gas)?.get(
+        self.buffer.read_ptr(heap)?.get(
             data_start_with_offset,
             self.byte_length / size_of::<T>() as u32,
             heap.api_version(),
@@ -175,7 +169,7 @@ pub struct AscString {
 impl AscString {
     pub fn new(content: &[u16]) -> Result<Self, DeterministicHostError> {
         if size_of_val(content) > u32::max_value() as usize {
-            return Err(DeterministicHostError::from(anyhow!(
+            return Err(DeterministicHostError(anyhow!(
                 "string cannot fit in WASM memory"
             )));
         }
@@ -228,7 +222,7 @@ impl AscType for AscString {
             let code_point_bytes = [
                 pair[0],
                 *pair.get(1).ok_or_else(|| {
-                    DeterministicHostError::from(anyhow!(
+                    DeterministicHostError(anyhow!(
                         "Attempted to read past end of string content bytes chunk"
                     ))
                 })?,
@@ -265,11 +259,10 @@ impl<T: AscValue> Array<T> {
     pub fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
-        gas: &GasCounter,
     ) -> Result<Self, DeterministicHostError> {
         let arr_buffer = class::ArrayBuffer::new(content, heap.api_version())?;
-        let buffer = AscPtr::alloc_obj(arr_buffer, heap, gas)?;
-        let buffer_data_length = buffer.read_len(heap, gas)?;
+        let buffer = AscPtr::alloc_obj(arr_buffer, heap)?;
+        let buffer_data_length = buffer.read_len(heap)?;
         Ok(Array {
             buffer: AscPtr::new(buffer.wasm_ptr()),
             buffer_data_start: buffer.wasm_ptr(),
@@ -282,7 +275,6 @@ impl<T: AscValue> Array<T> {
     pub(crate) fn to_vec<H: AscHeap + ?Sized>(
         &self,
         heap: &H,
-        gas: &GasCounter,
     ) -> Result<Vec<T>, DeterministicHostError> {
         // We're trying to read the pointer below, we should check it's
         // not null before using it.
@@ -298,13 +290,13 @@ impl<T: AscValue> Array<T> {
             .buffer_data_start
             .checked_sub(self.buffer.wasm_ptr())
             .ok_or_else(|| {
-                DeterministicHostError::from(anyhow::anyhow!(
+                DeterministicHostError(anyhow::anyhow!(
                     "Subtract overflow on pointer: {}",
                     self.buffer_data_start
                 ))
             })?;
 
-        self.buffer.read_ptr(heap, gas)?.get(
+        self.buffer.read_ptr(heap)?.get(
             buffer_data_start_with_offset,
             self.length as u32,
             heap.api_version(),

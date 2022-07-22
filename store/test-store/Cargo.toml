@@ -1,13 +1,13 @@
 [package]
 name = "test-store"
-version = "0.26.0"
+version = "0.24.1"
 authors = ["Leonardo Yvens <leoyvens@gmail.com>"]
-edition = "2021"
+edition = "2018"
 description = "Provides static store instance for tests."
 
 [dependencies]
 graph-graphql = { path = "../../graphql" }
-graphql-parser = "0.4.0"
+graphql-parser = "0.3"
 graph-mock = { path = "../../mock" }
 graph-node = { path = "../../node" }
 graph = { path = "../../graph" }

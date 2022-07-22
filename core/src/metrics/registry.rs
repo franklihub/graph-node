@@ -15,10 +15,7 @@ pub struct MetricsRegistry {
     /// Global metrics are lazily initialized and identified by
     /// the `Desc.id` that hashes the name and const label values
     global_counters: Arc<RwLock<HashMap<u64, Counter>>>,
-    global_counter_vecs: Arc<RwLock<HashMap<u64, CounterVec>>>,
     global_gauges: Arc<RwLock<HashMap<u64, Gauge>>>,
-    global_gauge_vecs: Arc<RwLock<HashMap<u64, GaugeVec>>>,
-    global_histogram_vecs: Arc<RwLock<HashMap<u64, HistogramVec>>>,
 }
 
 impl MetricsRegistry {
@@ -35,10 +32,7 @@ impl MetricsRegistry {
             unregister_errors,
             registered_metrics,
             global_counters: Arc::new(RwLock::new(HashMap::new())),
-            global_counter_vecs: Arc::new(RwLock::new(HashMap::new())),
             global_gauges: Arc::new(RwLock::new(HashMap::new())),
-            global_gauge_vecs: Arc::new(RwLock::new(HashMap::new())),
-            global_histogram_vecs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -81,33 +75,6 @@ impl MetricsRegistry {
             .register(gauge.clone())
             .expect("failed to register `registered_metrics` gauge");
         gauge
-    }
-
-    fn global_counter_vec_internal(
-        &self,
-        name: &str,
-        help: &str,
-        deployment: Option<&str>,
-        variable_labels: &[&str],
-    ) -> Result<CounterVec, PrometheusError> {
-        let opts = Opts::new(name, help);
-        let opts = match deployment {
-            None => opts,
-            Some(deployment) => opts.const_label("deployment", deployment),
-        };
-        let counters = CounterVec::new(opts, variable_labels)?;
-        let id = counters.desc().first().unwrap().id;
-        let maybe_counter = self.global_counter_vecs.read().unwrap().get(&id).cloned();
-        if let Some(counters) = maybe_counter {
-            Ok(counters)
-        } else {
-            self.register(name, Box::new(counters.clone()));
-            self.global_counter_vecs
-                .write()
-                .unwrap()
-                .insert(id, counters.clone());
-            Ok(counters)
-        }
     }
 }
 
@@ -181,25 +148,6 @@ impl MetricsRegistryTrait for MetricsRegistry {
         }
     }
 
-    fn global_counter_vec(
-        &self,
-        name: &str,
-        help: &str,
-        variable_labels: &[&str],
-    ) -> Result<CounterVec, PrometheusError> {
-        self.global_counter_vec_internal(name, help, None, variable_labels)
-    }
-
-    fn global_deployment_counter_vec(
-        &self,
-        name: &str,
-        help: &str,
-        subgraph: &str,
-        variable_labels: &[&str],
-    ) -> Result<CounterVec, PrometheusError> {
-        self.global_counter_vec_internal(name, help, Some(subgraph), variable_labels)
-    }
-
     fn global_gauge(
         &self,
         name: &str,
@@ -218,50 +166,6 @@ impl MetricsRegistryTrait for MetricsRegistry {
                 .unwrap()
                 .insert(id, gauge.clone());
             Ok(gauge)
-        }
-    }
-
-    fn global_gauge_vec(
-        &self,
-        name: &str,
-        help: &str,
-        variable_labels: &[&str],
-    ) -> Result<GaugeVec, PrometheusError> {
-        let opts = Opts::new(name, help);
-        let gauges = GaugeVec::new(opts, variable_labels)?;
-        let id = gauges.desc().first().unwrap().id;
-        let maybe_gauge = self.global_gauge_vecs.read().unwrap().get(&id).cloned();
-        if let Some(gauges) = maybe_gauge {
-            Ok(gauges)
-        } else {
-            self.register(name, Box::new(gauges.clone()));
-            self.global_gauge_vecs
-                .write()
-                .unwrap()
-                .insert(id, gauges.clone());
-            Ok(gauges)
-        }
-    }
-
-    fn global_histogram_vec(
-        &self,
-        name: &str,
-        help: &str,
-        variable_labels: &[&str],
-    ) -> Result<HistogramVec, PrometheusError> {
-        let opts = HistogramOpts::new(name, help);
-        let histograms = HistogramVec::new(opts, variable_labels)?;
-        let id = histograms.desc().first().unwrap().id;
-        let maybe_histogram = self.global_histogram_vecs.read().unwrap().get(&id).cloned();
-        if let Some(histograms) = maybe_histogram {
-            Ok(histograms)
-        } else {
-            self.register(name, Box::new(histograms.clone()));
-            self.global_histogram_vecs
-                .write()
-                .unwrap()
-                .insert(id, histograms.clone());
-            Ok(histograms)
         }
     }
 

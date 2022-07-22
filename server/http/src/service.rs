@@ -5,7 +5,6 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Instant;
 
-use graph::data::query::QueryResults;
 use graph::prelude::*;
 use graph::{components::server::query::GraphQLServerError, data::query::QueryTarget};
 use http::header;
@@ -16,10 +15,11 @@ use http::header::{
 use hyper::service::Service;
 use hyper::{Body, Method, Request, Response, StatusCode};
 
-use crate::request::parse_graphql_request;
+use crate::request::GraphQLRequest;
 
 pub struct GraphQLServiceMetrics {
     query_execution_time: Box<HistogramVec>,
+    failed_query_execution_time: Box<HistogramVec>,
 }
 
 impl fmt::Debug for GraphQLServiceMetrics {
@@ -29,40 +29,41 @@ impl fmt::Debug for GraphQLServiceMetrics {
 }
 
 impl GraphQLServiceMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
+    pub fn new(registry: Arc<impl MetricsRegistry>) -> Self {
         let query_execution_time = registry
             .new_histogram_vec(
                 "query_execution_time",
                 "Execution time for successful GraphQL queries",
-                vec![String::from("deployment"), String::from("status")],
+                vec![String::from("deployment")],
                 vec![0.1, 0.5, 1.0, 10.0, 100.0],
             )
             .expect("failed to create `query_execution_time` histogram");
 
+        let failed_query_execution_time = registry
+            .new_histogram_vec(
+                "query_failed_execution_time",
+                "Execution time for failed GraphQL queries",
+                vec![String::from("deployment")],
+                vec![0.1, 0.5, 1.0, 10.0, 100.0],
+            )
+            .expect("failed to create `query_failed_execution_time` histogram");
+
         Self {
             query_execution_time,
+            failed_query_execution_time,
         }
     }
 
-    pub fn observe_query(&self, duration: Duration, results: &QueryResults) {
-        let id = results
-            .deployment_hash()
-            .map(|h| h.as_str())
-            .unwrap_or_else(|| {
-                if results.not_found() {
-                    "notfound"
-                } else {
-                    "unknown"
-                }
-            });
-        let status = if results.has_errors() {
-            "failed"
-        } else {
-            "success"
-        };
+    pub fn observe_query_execution_time(&self, duration: f64, deployment_id: String) {
         self.query_execution_time
-            .with_label_values(&[id, status])
-            .observe(duration.as_secs_f64());
+            .with_label_values(vec![deployment_id.as_ref()].as_slice())
+            .observe(duration);
+    }
+
+    pub fn observe_failed_query_execution_time(&self, duration: f64, deployment_id: String) {
+        self.failed_query_execution_time
+            .with_label_values(vec![deployment_id.as_ref()].as_slice())
+            .observe(duration);
     }
 }
 
@@ -131,6 +132,23 @@ where
             .unwrap())
     }
 
+    /// Serves a static file.
+    fn serve_file(
+        &self,
+        contents: &'static str,
+        content_type: &'static str,
+    ) -> GraphQLServiceResponse {
+        async move {
+            Ok(Response::builder()
+                .status(200)
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(CONTENT_TYPE, content_type)
+                .body(Body::from(contents))
+                .unwrap())
+        }
+        .boxed()
+    }
+
     /// Serves a dynamically created file.
     fn serve_dynamic_file(&self, contents: String) -> GraphQLServiceResponse {
         async {
@@ -188,7 +206,7 @@ where
         let body = hyper::body::to_bytes(request_body)
             .map_err(|_| GraphQLServerError::InternalError("Failed to read request body".into()))
             .await?;
-        let query = parse_graphql_request(&body);
+        let query = GraphQLRequest::new(body).compat().await;
 
         let result = match query {
             Ok(query) => service.graphql_runner.run_query(query, target).await,
@@ -196,7 +214,10 @@ where
             Err(e) => return Err(e),
         };
 
-        service_metrics.observe_query(start.elapsed(), &result);
+        if let Some(id) = result.first().and_then(|res| res.deployment.clone()) {
+            service_metrics
+                .observe_query_execution_time(start.elapsed().as_secs_f64(), id.to_string());
+        }
 
         Ok(result.as_http_response())
     }
@@ -261,6 +282,13 @@ where
 
         match (method, path_segments.as_slice()) {
             (Method::GET, [""]) => self.index().boxed(),
+            (Method::GET, ["graphiql.css"]) => {
+                self.serve_file(include_str!("../assets/graphiql.css"), "text/css")
+            }
+            (Method::GET, ["graphiql.min.js"]) => {
+                self.serve_file(include_str!("../assets/graphiql.min.js"), "text/javascript")
+            }
+
             (Method::GET, &["subgraphs", "id", _, "graphql"])
             | (Method::GET, &["subgraphs", "name", _, "graphql"])
             | (Method::GET, &["subgraphs", "name", _, _, "graphql"])
@@ -359,10 +387,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use graph::data::value::Object;
     use http::status::StatusCode;
     use hyper::service::Service;
     use hyper::{Body, Method, Request};
+    use std::collections::BTreeMap;
 
     use graph::data::{
         graphql::effort::LoadManager,
@@ -398,10 +426,10 @@ mod tests {
         }
 
         async fn run_query(self: Arc<Self>, _query: Query, _target: QueryTarget) -> QueryResults {
-            QueryResults::from(Object::from_iter(
+            QueryResults::from(BTreeMap::from_iter(
                 vec![(
                     String::from("name"),
-                    r::Value::String(String::from("Jordi")),
+                    q::Value::String(String::from("Jordi")),
                 )]
                 .into_iter(),
             ))

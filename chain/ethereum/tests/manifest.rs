@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use graph::data::subgraph::schema::SubgraphError;
-use graph::data::subgraph::{SPEC_VERSION_0_0_4, SPEC_VERSION_0_0_7};
+use graph::data::subgraph::SPEC_VERSION_0_0_4;
 use graph::prelude::{
     anyhow, async_trait, serde_yaml, tokio, DeploymentHash, Entity, Link, Logger, SubgraphManifest,
     SubgraphManifestValidationError, UnvalidatedSubgraphManifest,
@@ -18,16 +17,14 @@ use graph::{
 };
 
 use graph_chain_ethereum::{Chain, NodeCapabilities};
-use semver::Version;
 use test_store::LOGGER;
 
 const GQL_SCHEMA: &str = "type Thing @entity { id: ID! }";
 const GQL_SCHEMA_FULLTEXT: &str = include_str!("full-text.graphql");
 const MAPPING_WITH_IPFS_FUNC_WASM: &[u8] = include_bytes!("ipfs-on-ethereum-contracts.wasm");
 const ABI: &str = "[{\"type\":\"function\", \"inputs\": [{\"name\": \"i\",\"type\": \"uint256\"}],\"name\":\"get\",\"outputs\": [{\"type\": \"address\",\"name\": \"o\"}]}]";
-const FILE: &str = "{}";
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default)]
 struct TextResolver {
     texts: HashMap<String, Vec<u8>>,
 }
@@ -43,12 +40,12 @@ impl TextResolver {
 
 #[async_trait]
 impl LinkResolverTrait for TextResolver {
-    fn with_timeout(&self, _timeout: Duration) -> Box<dyn LinkResolverTrait> {
-        Box::new(self.clone())
+    fn with_timeout(self, _timeout: Duration) -> Self {
+        self
     }
 
-    fn with_retries(&self) -> Box<dyn LinkResolverTrait> {
-        Box::new(self.clone())
+    fn with_retries(self) -> Self {
+        self
     }
 
     async fn cat(&self, _logger: &Logger, link: &Link) -> Result<Vec<u8>, anyhow::Error> {
@@ -56,10 +53,6 @@ impl LinkResolverTrait for TextResolver {
             .get(&link.link)
             .ok_or(anyhow!("No text for {}", &link.link))
             .map(Clone::clone)
-    }
-
-    async fn get_block(&self, _logger: &Logger, _link: &Link) -> Result<Vec<u8>, anyhow::Error> {
-        unimplemented!()
     }
 
     async fn json_stream(
@@ -71,10 +64,7 @@ impl LinkResolverTrait for TextResolver {
     }
 }
 
-async fn resolve_manifest(
-    text: &str,
-    max_spec_version: Version,
-) -> SubgraphManifest<graph_chain_ethereum::Chain> {
+async fn resolve_manifest(text: &str) -> SubgraphManifest<graph_chain_ethereum::Chain> {
     let mut resolver = TextResolver::default();
     let id = DeploymentHash::new("Qmmanifest").unwrap();
 
@@ -82,12 +72,9 @@ async fn resolve_manifest(
     resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
     resolver.add("/ipfs/Qmabi", &ABI);
     resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
-    resolver.add("/ipfs/Qmfile", &FILE);
-
-    let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
 
     let raw = serde_yaml::from_str(text).unwrap();
-    SubgraphManifest::resolve_from_raw(id, raw, &resolver, &LOGGER, max_spec_version)
+    SubgraphManifest::resolve_from_raw(id, raw, &resolver, &LOGGER, SPEC_VERSION_0_0_4.clone())
         .await
         .expect("Parsing simple manifest works")
 }
@@ -99,12 +86,16 @@ async fn resolve_unvalidated(text: &str) -> UnvalidatedSubgraphManifest<Chain> {
     resolver.add(id.as_str(), &text);
     resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
 
-    let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
-
     let raw = serde_yaml::from_str(text).unwrap();
-    UnvalidatedSubgraphManifest::resolve(id, raw, &resolver, &LOGGER, SPEC_VERSION_0_0_4.clone())
-        .await
-        .expect("Parsing simple manifest works")
+    UnvalidatedSubgraphManifest::resolve(
+        id,
+        raw,
+        Arc::new(resolver),
+        &LOGGER,
+        SPEC_VERSION_0_0_4.clone(),
+    )
+    .await
+    .expect("Parsing simple manifest works")
 }
 
 // Some of these manifest tests should be made chain-independent, but for
@@ -120,40 +111,10 @@ schema:
 specVersion: 0.0.2
 ";
 
-    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+    let manifest = resolve_manifest(YAML).await;
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
     assert!(manifest.graft.is_none());
-}
-
-#[tokio::test]
-async fn ipfs_manifest() {
-    const YAML: &str = "
-schema:
-  file:
-    /: /ipfs/Qmschema
-dataSources:
-  - name: IpfsSource
-    kind: file/ipfs
-    source:
-      file:
-        /: /ipfs/Qmfile
-    mapping:
-      apiVersion: 0.0.6
-      language: wasm/assemblyscript
-      entities:
-        - TestEntity
-      file:
-        /: /ipfs/Qmmapping
-      handler: handleFile
-specVersion: 0.0.7
-";
-
-    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_7).await;
-
-    assert_eq!("Qmmanifest", manifest.id.as_str());
-    assert_eq!(manifest.offchain_data_sources.len(), 1);
-    assert_eq!(manifest.data_sources.len(), 0);
 }
 
 #[tokio::test]
@@ -169,88 +130,12 @@ graft:
 specVersion: 0.0.2
 ";
 
-    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+    let manifest = resolve_manifest(YAML).await;
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
     let graft = manifest.graft.expect("The manifest has a graft base");
     assert_eq!("Qmbase", graft.base.as_str());
     assert_eq!(12345, graft.block);
-}
-
-#[test]
-fn graft_failed_subgraph() {
-    const YAML: &str = "
-dataSources: []
-schema:
-  file:
-    /: /ipfs/Qmschema
-graft:
-  base: Qmbase
-  block: 0
-specVersion: 0.0.2
-";
-
-    test_store::run_test_sequentially(|store| async move {
-        let subgraph_store = store.subgraph_store();
-
-        let unvalidated = resolve_unvalidated(YAML).await;
-        let subgraph = DeploymentHash::new("Qmbase").unwrap();
-
-        // Creates base subgraph at block 0 (genesis).
-        let deployment = test_store::create_test_subgraph(&subgraph, GQL_SCHEMA).await;
-
-        // Adds an example entity.
-        let mut thing = Entity::new();
-        thing.set("id", "datthing");
-        test_store::insert_entities(&deployment, vec![(EntityType::from("Thing"), thing)])
-            .await
-            .unwrap();
-
-        let error = SubgraphError {
-            subgraph_id: deployment.hash.clone(),
-            message: "deterministic error".to_string(),
-            block_ptr: Some(test_store::BLOCKS[1].clone()),
-            handler: None,
-            deterministic: true,
-        };
-
-        // Fails the base subgraph at block 1 (and advances the pointer).
-        test_store::transact_errors(
-            &store,
-            &deployment,
-            test_store::BLOCKS[1].clone(),
-            vec![error],
-        )
-        .await
-        .unwrap();
-
-        // Make sure there are no GraftBaseInvalid errors.
-        //
-        // This is allowed because:
-        // - base:  failed at block 1
-        // - graft: starts at block 0
-        //
-        // Meaning that the graft will fail just like it's parent
-        // but it started at a valid previous block.
-        assert!(
-            unvalidated
-                .validate(subgraph_store.clone(), true)
-                .await
-                .expect_err("Validation must fail")
-                .into_iter()
-                .find(|e| matches!(e, SubgraphManifestValidationError::GraftBaseInvalid(_)))
-                .is_none(),
-            "There shouldn't be a GraftBaseInvalid error"
-        );
-
-        // Resolve the graft normally.
-        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
-
-        assert_eq!("Qmmanifest", manifest.id.as_str());
-        let graft = manifest.graft.expect("The manifest has a graft base");
-        assert_eq!("Qmbase", graft.base.as_str());
-        assert_eq!(0, graft.block);
-    })
 }
 
 #[test]
@@ -267,7 +152,7 @@ specVersion: 0.0.2
 ";
 
     test_store::run_test_sequentially(|store| async move {
-        let subgraph_store = store.subgraph_store();
+        let store = store.subgraph_store();
 
         let unvalidated = resolve_unvalidated(YAML).await;
         let subgraph = DeploymentHash::new("Qmbase").unwrap();
@@ -275,14 +160,13 @@ specVersion: 0.0.2
         //
         // Validation against subgraph that hasn't synced anything fails
         //
-        let deployment = test_store::create_test_subgraph(&subgraph, GQL_SCHEMA).await;
+        let deployment = test_store::create_test_subgraph(&subgraph, GQL_SCHEMA);
         // This check is awkward since the test manifest has other problems
         // that the validation complains about as setting up a valid manifest
         // would be a bit more work; we just want to make sure that
         // graft-related checks work
         let msg = unvalidated
-            .validate(subgraph_store.clone(), true)
-            .await
+            .validate(store.clone(), true)
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| matches!(e, SubgraphManifestValidationError::GraftBaseInvalid(_)))
@@ -297,14 +181,12 @@ specVersion: 0.0.2
         let mut thing = Entity::new();
         thing.set("id", "datthing");
         test_store::insert_entities(&deployment, vec![(EntityType::from("Thing"), thing)])
-            .await
-            .unwrap();
+            .expect("Can insert a thing");
 
         // Validation against subgraph that has not reached the graft point fails
         let unvalidated = resolve_unvalidated(YAML).await;
         let msg = unvalidated
-            .validate(subgraph_store.clone(), true)
-            .await
+            .validate(store, true)
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| matches!(e, SubgraphManifestValidationError::GraftBaseInvalid(_)))
@@ -313,48 +195,6 @@ specVersion: 0.0.2
         assert_eq!(
             "the graft base is invalid: failed to graft onto `Qmbase` \
             at block 1 since it has only processed block 0",
-            msg
-        );
-
-        let error = SubgraphError {
-            subgraph_id: deployment.hash.clone(),
-            message: "deterministic error".to_string(),
-            block_ptr: Some(test_store::BLOCKS[1].clone()),
-            handler: None,
-            deterministic: true,
-        };
-
-        test_store::transact_errors(
-            &store,
-            &deployment,
-            test_store::BLOCKS[1].clone(),
-            vec![error],
-        )
-        .await
-        .unwrap();
-
-        // This check is bit awkward, but we just want to be sure there is a
-        // GraftBaseInvalid error.
-        //
-        // The validation error happens because:
-        // - base:  failed at block 1
-        // - graft: starts at block 1
-        //
-        // Since we start grafts at N + 1, we can't allow a graft to be created
-        // at the failed block. They (developers) should choose a previous valid
-        // block.
-        let unvalidated = resolve_unvalidated(YAML).await;
-        let msg = unvalidated
-            .validate(subgraph_store, true)
-            .await
-            .expect_err("Validation must fail")
-            .into_iter()
-            .find(|e| matches!(e, SubgraphManifestValidationError::GraftBaseInvalid(_)))
-            .expect("There must be a GraftBaseInvalid error")
-            .to_string();
-        assert_eq!(
-            "the graft base is invalid: failed to graft onto `Qmbase` \
-            at block 1 since it's not healthy. You can graft it starting at block 0 backwards",
             msg
         );
     })
@@ -391,7 +231,7 @@ schema:
 specVersion: 0.0.2
 ";
 
-    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+    let manifest = resolve_manifest(YAML).await;
     let required_capabilities = NodeCapabilities::from_data_sources(&manifest.data_sources);
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
@@ -415,7 +255,6 @@ graft:
         let unvalidated = resolve_unvalidated(YAML).await;
         let error_msg = unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -452,7 +291,6 @@ graft:
         let unvalidated = resolve_unvalidated(YAML).await;
         assert!(unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -462,7 +300,7 @@ graft:
                 )
             })
             .is_none());
-        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+        let manifest = resolve_manifest(YAML).await;
         assert!(manifest.features.contains(&SubgraphFeature::Grafting))
     })
 }
@@ -483,7 +321,6 @@ schema:
         let unvalidated = resolve_unvalidated(YAML).await;
         assert!(unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -494,7 +331,7 @@ schema:
             })
             .is_none());
 
-        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+        let manifest = resolve_manifest(YAML).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
     });
 }
@@ -520,13 +357,11 @@ schema:
             resolver.add("/ipfs/Qmabi", &ABI);
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA_FULLTEXT);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
-
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
-                &resolver,
+                Arc::new(resolver),
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -536,7 +371,6 @@ schema:
 
         assert!(unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -547,7 +381,7 @@ schema:
             })
             .is_none());
 
-        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+        let manifest = resolve_manifest(YAML).await;
         assert!(manifest.features.contains(&SubgraphFeature::FullTextSearch))
     });
 }
@@ -572,13 +406,11 @@ schema:
             resolver.add("/ipfs/Qmabi", &ABI);
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA_FULLTEXT);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
-
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
-                &resolver,
+                Arc::new(resolver),
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -588,7 +420,6 @@ schema:
 
         let error_msg = unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -648,13 +479,11 @@ dataSources:
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
             resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
-
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
-                &resolver,
+                Arc::new(resolver),
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -664,7 +493,6 @@ dataSources:
 
         let error_msg = unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -726,13 +554,11 @@ dataSources:
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
             resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
-
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
-                &resolver,
+                Arc::new(resolver),
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -742,7 +568,6 @@ dataSources:
 
         assert!(unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -771,7 +596,6 @@ schema:
         let unvalidated = resolve_unvalidated(YAML).await;
         assert!(unvalidated
             .validate(store.clone(), true)
-            .await
             .expect_err("Validation must fail")
             .into_iter()
             .find(|e| {
@@ -782,7 +606,7 @@ schema:
             })
             .is_none());
 
-        let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
+        let manifest = resolve_manifest(YAML).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
     });
 }

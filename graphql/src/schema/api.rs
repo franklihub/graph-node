@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use graphql_parser::Pos;
 use inflector::Inflector;
@@ -9,6 +9,7 @@ use crate::schema::ast;
 use graph::data::{
     graphql::ext::{DirectiveExt, DocumentExt, ValueExt},
     schema::{META_FIELD_NAME, META_FIELD_TYPE, SCHEMA_TYPE_NAME},
+    subgraph::SubgraphFeature,
 };
 use graph::prelude::s::{Value, *};
 use graph::prelude::*;
@@ -24,9 +25,8 @@ pub enum APISchemaError {
     FulltextSearchNonDeterministic,
 }
 
-// The followoing types are defined in meta.graphql
 const BLOCK_HEIGHT: &str = "Block_height";
-const CHANGE_BLOCK_FILTER_NAME: &str = "BlockChangedFilter";
+
 const ERROR_POLICY_TYPE: &str = "_SubgraphErrorPolicy_";
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -59,36 +59,32 @@ impl TryFrom<&q::Value> for ErrorPolicy {
     }
 }
 
-impl TryFrom<&r::Value> for ErrorPolicy {
-    type Error = anyhow::Error;
-
-    /// `value` should be the output of input value coercion.
-    fn try_from(value: &r::Value) -> Result<Self, Self::Error> {
-        match value {
-            r::Value::Enum(s) => ErrorPolicy::from_str(s),
-            _ => Err(anyhow::anyhow!("invalid `ErrorPolicy`")),
-        }
-    }
-}
-
 /// Derives a full-fledged GraphQL API schema from an input schema.
 ///
 /// The input schema should only have type/enum/interface/union definitions
-/// and must not include a root Query type. This Query type is derived, with
-/// all its fields and their input arguments, based on the existing types.
-pub fn api_schema(input_schema: &Document) -> Result<Document, APISchemaError> {
+/// and must not include a root Query type. This Query type is derived,
+/// with all its fields and their input arguments, based on the existing
+/// types.
+pub fn api_schema(
+    input_schema: &Document,
+    features: &BTreeSet<SubgraphFeature>,
+) -> Result<Document, APISchemaError> {
     // Refactor: Take `input_schema` by value.
     let object_types = input_schema.get_object_type_definitions();
     let interface_types = input_schema.get_interface_type_definitions();
 
     // Refactor: Don't clone the schema.
     let mut schema = input_schema.clone();
+    add_directives(&mut schema);
+    add_builtin_scalar_types(&mut schema)?;
+    add_order_direction_enum(&mut schema);
+    add_block_height_type(&mut schema);
     add_meta_field_type(&mut schema);
     add_types_for_object_types(&mut schema, &object_types)?;
     add_types_for_interface_types(&mut schema, &interface_types)?;
     add_field_arguments(&mut schema, input_schema)?;
-    add_query_type(&mut schema, &object_types, &interface_types)?;
-    add_subscription_type(&mut schema, &object_types, &interface_types)?;
+    add_query_type(&mut schema, &object_types, &interface_types, features)?;
+    add_subscription_type(&mut schema, &object_types, &interface_types, features)?;
 
     // Remove the `_Schema_` type from the generated schema.
     schema.definitions.retain(|d| match d {
@@ -100,6 +96,133 @@ pub fn api_schema(input_schema: &Document) -> Result<Document, APISchemaError> {
     });
 
     Ok(schema)
+}
+
+/// Adds built-in GraphQL scalar types (`Int`, `String` etc.) to the schema.
+fn add_builtin_scalar_types(schema: &mut Document) -> Result<(), APISchemaError> {
+    for name in [
+        "Boolean",
+        "ID",
+        "Int",
+        "BigDecimal",
+        "String",
+        "Bytes",
+        "BigInt",
+    ]
+    .iter()
+    {
+        match schema.get_named_type(name) {
+            None => {
+                let typedef = TypeDefinition::Scalar(ScalarType {
+                    position: Pos::default(),
+                    description: None,
+                    name: name.to_string(),
+                    directives: vec![],
+                });
+                let def = Definition::TypeDefinition(typedef);
+                schema.definitions.push(def);
+            }
+            Some(_) => return Err(APISchemaError::TypeExists(name.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Add directive definitions for our custom directives
+fn add_directives(schema: &mut Document) {
+    let entity = Definition::DirectiveDefinition(DirectiveDefinition {
+        position: Pos::default(),
+        description: None,
+        name: "entity".to_owned(),
+        arguments: vec![],
+        locations: vec![DirectiveLocation::Object],
+    });
+
+    let derived_from = Definition::DirectiveDefinition(DirectiveDefinition {
+        position: Pos::default(),
+        description: None,
+        name: "derivedFrom".to_owned(),
+        arguments: vec![InputValue {
+            position: Pos::default(),
+            description: None,
+            name: "field".to_owned(),
+            value_type: Type::NamedType("String".to_owned()),
+            default_value: None,
+            directives: vec![],
+        }],
+        locations: vec![DirectiveLocation::FieldDefinition],
+    });
+
+    let subgraph_id = Definition::DirectiveDefinition(DirectiveDefinition {
+        position: Pos::default(),
+        description: None,
+        name: "subgraphId".to_owned(),
+        arguments: vec![InputValue {
+            position: Pos::default(),
+            description: None,
+            name: "id".to_owned(),
+            value_type: Type::NamedType("String".to_owned()),
+            default_value: None,
+            directives: vec![],
+        }],
+        locations: vec![DirectiveLocation::Object],
+    });
+
+    schema.definitions.push(entity);
+    schema.definitions.push(derived_from);
+    schema.definitions.push(subgraph_id);
+}
+
+/// Adds a global `OrderDirection` type to the schema.
+fn add_order_direction_enum(schema: &mut Document) {
+    let typedef = TypeDefinition::Enum(EnumType {
+        position: Pos::default(),
+        description: None,
+        name: "OrderDirection".to_string(),
+        directives: vec![],
+        values: ["asc", "desc"]
+            .iter()
+            .map(|name| EnumValue {
+                position: Pos::default(),
+                description: None,
+                name: name.to_string(),
+                directives: vec![],
+            })
+            .collect(),
+    });
+    let def = Definition::TypeDefinition(typedef);
+    schema.definitions.push(def);
+}
+
+/// Adds a global `Block_height` type to the schema. The `block` argument
+/// accepts values of this type
+fn add_block_height_type(schema: &mut Document) {
+    let typedef = TypeDefinition::InputObject(InputObjectType {
+        position: Pos::default(),
+        description: None,
+        name: BLOCK_HEIGHT.to_string(),
+        directives: vec![],
+        fields: vec![
+            InputValue {
+                position: Pos::default(),
+                description: None,
+                name: "hash".to_owned(),
+                value_type: Type::NamedType("Bytes".to_owned()),
+                default_value: None,
+                directives: vec![],
+            },
+            InputValue {
+                position: Pos::default(),
+                description: None,
+                name: "number".to_owned(),
+                value_type: Type::NamedType("Int".to_owned()),
+                default_value: None,
+                directives: vec![],
+            },
+        ],
+    });
+    let def = Definition::TypeDefinition(typedef);
+    schema.definitions.push(def);
 }
 
 /// Adds a global `_Meta_` type to the schema. The `_meta` field
@@ -119,7 +242,7 @@ fn add_meta_field_type(schema: &mut Document) {
 
 fn add_types_for_object_types(
     schema: &mut Document,
-    object_types: &[&ObjectType],
+    object_types: &Vec<&ObjectType>,
 ) -> Result<(), APISchemaError> {
     for object_type in object_types {
         if !object_type.name.eq(SCHEMA_TYPE_NAME) {
@@ -148,7 +271,7 @@ fn add_order_by_type(
     type_name: &str,
     fields: &[Field],
 ) -> Result<(), APISchemaError> {
-    let type_name = format!("{}_orderBy", type_name);
+    let type_name = format!("{}_orderBy", type_name).to_string();
 
     match schema.get_named_type(&type_name) {
         None => {
@@ -182,18 +305,15 @@ fn add_filter_type(
     type_name: &str,
     fields: &[Field],
 ) -> Result<(), APISchemaError> {
-    let filter_type_name = format!("{}_filter", type_name);
+    let filter_type_name = format!("{}_filter", type_name).to_string();
     match schema.get_named_type(&filter_type_name) {
         None => {
-            let mut generated_filter_fields = field_input_values(schema, fields)?;
-            generated_filter_fields.push(block_changed_filter_argument());
-
             let typedef = TypeDefinition::InputObject(InputObjectType {
                 position: Pos::default(),
                 description: None,
                 name: filter_type_name,
                 directives: vec![],
-                fields: generated_filter_fields,
+                fields: field_input_values(schema, fields)?,
             });
             let def = Definition::TypeDefinition(typedef);
             schema.definitions.push(def);
@@ -228,25 +348,7 @@ fn field_filter_input_values(
                 .get_named_type(name)
                 .ok_or_else(|| APISchemaError::TypeNotFound(name.clone()))?;
             Ok(match named_type {
-                TypeDefinition::Object(_) => {
-                    let mut input_values = match ast::get_derived_from_directive(field) {
-                        // Only add `where` filter fields for object and interface fields
-                        // if they are not @derivedFrom
-                        Some(_) => vec![],
-                        // We allow filtering with `where: { other: "some-id" }` and
-                        // `where: { others: ["some-id", "other-id"] }`. In both cases,
-                        // we allow ID strings as the values to be passed to these
-                        // filters.
-                        None => field_scalar_filter_input_values(
-                            schema,
-                            field,
-                            &ScalarType::new(String::from("String")),
-                        ),
-                    };
-                    extend_with_child_filter_input_value(field, name, &mut input_values);
-                    input_values
-                }
-                TypeDefinition::Interface(_) => {
+                TypeDefinition::Object(_) | TypeDefinition::Interface(_) => {
                     // Only add `where` filter fields for object and interface fields
                     // if they are not @derivedFrom
                     if ast::get_derived_from_directive(field).is_some() {
@@ -298,17 +400,11 @@ fn field_scalar_filter_input_values(
             "in",
             "not_in",
             "contains",
-            "contains_nocase",
             "not_contains",
-            "not_contains_nocase",
             "starts_with",
-            "starts_with_nocase",
             "not_starts_with",
-            "not_starts_with_nocase",
             "ends_with",
-            "ends_with_nocase",
             "not_ends_with",
-            "not_ends_with_nocase",
         ],
         _ => vec!["", "not"],
     }
@@ -324,38 +420,27 @@ fn field_scalar_filter_input_values(
     .collect()
 }
 
-/// Appends a child filter to input values
-fn extend_with_child_filter_input_value(
-    field: &Field,
-    field_type_name: &String,
-    input_values: &mut Vec<InputValue>,
-) {
-    input_values.push(input_value(
-        &format!("{}_", field.name),
-        "",
-        Type::NamedType(format!("{}_filter", field_type_name)),
-    ));
-}
-
 /// Generates `*_filter` input values for the given enum field.
 fn field_enum_filter_input_values(
     _schema: &Document,
     field: &Field,
     field_type: &EnumType,
 ) -> Vec<InputValue> {
-    vec!["", "not", "in", "not_in"]
-        .into_iter()
-        .map(|filter_type| {
-            let field_type = Type::NamedType(field_type.name.to_owned());
-            let value_type = match filter_type {
-                "in" | "not_in" => {
-                    Type::ListType(Box::new(Type::NonNullType(Box::new(field_type))))
-                }
-                _ => field_type,
-            };
-            input_value(&field.name, filter_type, value_type)
-        })
-        .collect()
+    vec![
+        Some(input_value(
+            &field.name,
+            "",
+            Type::NamedType(field_type.name.to_owned()),
+        )),
+        Some(input_value(
+            &field.name,
+            "not",
+            Type::NamedType(field_type.name.to_owned()),
+        )),
+    ]
+    .into_iter()
+    .filter_map(|value_opt| value_opt)
+    .collect()
 }
 
 /// Generates `*_filter` input values for the given list field.
@@ -369,60 +454,33 @@ fn field_list_filter_input_values(
         // Decide what type of values can be passed to the filter. In the case
         // one-to-many or many-to-many object or interface fields that are not
         // derived, we allow ID strings to be passed on.
-        // Adds child filter only to object types.
-        let (input_field_type, parent_type_name) = match typedef {
-            TypeDefinition::Object(parent) => {
+        let input_field_type = match typedef {
+            TypeDefinition::Interface(_) | TypeDefinition::Object(_) => {
                 if ast::get_derived_from_directive(field).is_some() {
-                    (None, Some(parent.name.clone()))
+                    return None;
                 } else {
-                    (
-                        Some(Type::NamedType("String".into())),
-                        Some(parent.name.clone()),
+                    Type::NamedType("String".into())
+                }
+            }
+            TypeDefinition::Scalar(ref t) => Type::NamedType(t.name.to_owned()),
+            TypeDefinition::Enum(ref t) => Type::NamedType(t.name.to_owned()),
+            TypeDefinition::InputObject(_) | TypeDefinition::Union(_) => return None,
+        };
+
+        Some(
+            vec!["", "not", "contains", "not_contains"]
+                .into_iter()
+                .map(|filter_type| {
+                    input_value(
+                        &field.name,
+                        filter_type,
+                        Type::ListType(Box::new(Type::NonNullType(Box::new(
+                            input_field_type.clone(),
+                        )))),
                     )
-                }
-            }
-            TypeDefinition::Interface(_) => {
-                if ast::get_derived_from_directive(field).is_some() {
-                    (None, None)
-                } else {
-                    (Some(Type::NamedType("String".into())), None)
-                }
-            }
-            TypeDefinition::Scalar(ref t) => (Some(Type::NamedType(t.name.to_owned())), None),
-            TypeDefinition::Enum(ref t) => (Some(Type::NamedType(t.name.to_owned())), None),
-            TypeDefinition::InputObject(_) | TypeDefinition::Union(_) => (None, None),
-        };
-
-        let mut input_values: Vec<InputValue> = match input_field_type {
-            None => {
-                vec![]
-            }
-            Some(input_field_type) => vec![
-                "",
-                "not",
-                "contains",
-                "contains_nocase",
-                "not_contains",
-                "not_contains_nocase",
-            ]
-            .into_iter()
-            .map(|filter_type| {
-                input_value(
-                    &field.name,
-                    filter_type,
-                    Type::ListType(Box::new(Type::NonNullType(Box::new(
-                        input_field_type.clone(),
-                    )))),
-                )
-            })
-            .collect(),
-        };
-
-        if let Some(parent) = parent_type_name {
-            extend_with_child_filter_input_value(field, &parent, &mut input_values);
-        }
-
-        Some(input_values)
+                })
+                .collect(),
+        )
     })
 }
 
@@ -447,6 +505,7 @@ fn add_query_type(
     schema: &mut Document,
     object_types: &[&ObjectType],
     interface_types: &[&InterfaceType],
+    features: &BTreeSet<SubgraphFeature>,
 ) -> Result<(), APISchemaError> {
     let type_name = String::from("Query");
 
@@ -456,16 +515,16 @@ fn add_query_type(
 
     let mut fields = object_types
         .iter()
-        .map(|t| t.name.as_str())
+        .map(|t| &t.name)
         .filter(|name| !name.eq(&SCHEMA_TYPE_NAME))
-        .chain(interface_types.iter().map(|t| t.name.as_str()))
-        .flat_map(query_fields_for_type)
+        .chain(interface_types.iter().map(|t| &t.name))
+        .flat_map(|name| query_fields_for_type(name, features))
         .collect::<Vec<Field>>();
     let mut fulltext_fields = schema
         .get_fulltext_directives()
         .map_err(|_| APISchemaError::FulltextSearchNonDeterministic)?
         .iter()
-        .filter_map(|fulltext| query_field_for_fulltext(fulltext))
+        .filter_map(|fulltext| query_field_for_fulltext(fulltext, features))
         .collect();
     fields.append(&mut fulltext_fields);
     fields.push(meta_field());
@@ -476,14 +535,17 @@ fn add_query_type(
         name: type_name,
         implements_interfaces: vec![],
         directives: vec![],
-        fields,
+        fields: fields,
     });
     let def = Definition::TypeDefinition(typedef);
     schema.definitions.push(def);
     Ok(())
 }
 
-fn query_field_for_fulltext(fulltext: &Directive) -> Option<Field> {
+fn query_field_for_fulltext(
+    fulltext: &Directive,
+    features: &BTreeSet<SubgraphFeature>,
+) -> Option<Field> {
     let name = fulltext.argument("name").unwrap().as_str().unwrap().into();
 
     let includes = fulltext.argument("include").unwrap().as_list().unwrap();
@@ -524,13 +586,15 @@ fn query_field_for_fulltext(fulltext: &Directive) -> Option<Field> {
         block_argument(),
     ];
 
-    arguments.push(subgraph_error_argument());
+    if features.contains(&SubgraphFeature::NonFatalErrors) {
+        arguments.push(subgraph_error_argument())
+    }
 
     Some(Field {
         position: Pos::default(),
         description: None,
         name,
-        arguments,
+        arguments: arguments,
         field_type: Type::NonNullType(Box::new(Type::ListType(Box::new(Type::NonNullType(
             Box::new(Type::NamedType(entity_name.into())),
         ))))), // included entity type name
@@ -543,6 +607,7 @@ fn add_subscription_type(
     schema: &mut Document,
     object_types: &[&ObjectType],
     interface_types: &[&InterfaceType],
+    features: &BTreeSet<SubgraphFeature>,
 ) -> Result<(), APISchemaError> {
     let type_name = String::from("Subscription");
 
@@ -555,7 +620,7 @@ fn add_subscription_type(
         .map(|t| &t.name)
         .filter(|name| !name.eq(&SCHEMA_TYPE_NAME))
         .chain(interface_types.iter().map(|t| &t.name))
-        .flat_map(|name| query_fields_for_type(name))
+        .flat_map(|name| query_fields_for_type(name, features))
         .collect();
     fields.push(meta_field());
 
@@ -577,27 +642,13 @@ fn block_argument() -> InputValue {
         position: Pos::default(),
         description: Some(
             "The block at which the query should be executed. \
-             Can either be a `{ hash: Bytes }` value containing a block hash, \
-             a `{ number: Int }` containing the block number, \
-             or a `{ number_gte: Int }` containing the minimum block number. \
-             In the case of `number_gte`, the query will be executed on the latest block only if \
-             the subgraph has progressed to or past the minimum block number. \
-             Defaults to the latest block when omitted."
+             Can either be an `{ number: Int }` containing the block number \
+             or a `{ hash: Bytes }` value containing a block hash. Defaults \
+             to the latest block when omitted."
                 .to_owned(),
         ),
         name: "block".to_string(),
         value_type: Type::NamedType(BLOCK_HEIGHT.to_owned()),
-        default_value: None,
-        directives: vec![],
-    }
-}
-
-fn block_changed_filter_argument() -> InputValue {
-    InputValue {
-        position: Pos::default(),
-        description: Some("Filter for the block changed event.".to_owned()),
-        name: "_change_block".to_string(),
-        value_type: Type::NamedType(CHANGE_BLOCK_FILTER_NAME.to_owned()),
         default_value: None,
         directives: vec![],
     }
@@ -618,7 +669,7 @@ fn subgraph_error_argument() -> InputValue {
 }
 
 /// Generates `Query` fields for the given type name (e.g. `users` and `user`).
-fn query_fields_for_type(type_name: &str) -> Vec<Field> {
+fn query_fields_for_type(type_name: &str, features: &BTreeSet<SubgraphFeature>) -> Vec<Field> {
     let mut collection_arguments = collection_arguments_for_named_type(type_name);
     collection_arguments.push(block_argument());
 
@@ -634,8 +685,10 @@ fn query_fields_for_type(type_name: &str) -> Vec<Field> {
         block_argument(),
     ];
 
-    collection_arguments.push(subgraph_error_argument());
-    by_id_arguments.push(subgraph_error_argument());
+    if features.contains(&SubgraphFeature::NonFatalErrors) {
+        collection_arguments.push(subgraph_error_argument());
+        by_id_arguments.push(subgraph_error_argument());
+    }
 
     vec![
         Field {
@@ -758,9 +811,9 @@ fn add_field_arguments(
     for input_interface_type in input_schema.get_interface_type_definitions() {
         for input_field in &input_interface_type.fields {
             if let Some(input_reference_type) =
-                ast::get_referenced_entity_type(input_schema, input_field)
+                ast::get_referenced_entity_type(input_schema, &input_field)
             {
-                if ast::is_list_or_non_null_list_field(input_field) {
+                if ast::is_list_or_non_null_list_field(&input_field) {
                     // Get corresponding interface type and field in the output schema
                     let interface_type =
                         ast::get_interface_type_mut(schema, &input_interface_type.name)
@@ -792,7 +845,11 @@ fn add_field_arguments(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::iter::FromIterator;
+
     use graph::data::graphql::DocumentExt;
+    use graph::data::subgraph::SubgraphFeature;
     use graphql_parser::schema::*;
 
     use super::api_schema;
@@ -802,7 +859,8 @@ mod tests {
     fn api_schema_contains_built_in_scalar_types() {
         let input_schema =
             parse_schema("type User { id: ID! }").expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derive API schema");
+        let schema =
+            api_schema(&input_schema, &BTreeSet::new()).expect("Failed to derive API schema");
 
         schema
             .get_named_type("Boolean")
@@ -825,7 +883,8 @@ mod tests {
     fn api_schema_contains_order_direction_enum() {
         let input_schema = parse_schema("type User { id: ID!, name: String! }")
             .expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derived API schema");
+        let schema =
+            api_schema(&input_schema, &BTreeSet::new()).expect("Failed to derived API schema");
 
         let order_direction = schema
             .get_named_type("OrderDirection")
@@ -848,7 +907,8 @@ mod tests {
     fn api_schema_contains_query_type() {
         let input_schema =
             parse_schema("type User { id: ID! }").expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derive API schema");
+        let schema =
+            api_schema(&input_schema, &BTreeSet::new()).expect("Failed to derive API schema");
         schema
             .get_named_type("Query")
             .expect("Root Query type is missing in API schema");
@@ -858,7 +918,11 @@ mod tests {
     fn api_schema_contains_field_order_by_enum() {
         let input_schema = parse_schema("type User { id: ID!, name: String! }")
             .expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derived API schema");
+        let schema = api_schema(
+            &input_schema,
+            &BTreeSet::from_iter(Some(SubgraphFeature::NonFatalErrors)),
+        )
+        .expect("Failed to derived API schema");
 
         let user_order_by = schema
             .get_named_type("User_orderBy")
@@ -882,12 +946,6 @@ mod tests {
     fn api_schema_contains_object_type_filter_enum() {
         let input_schema = parse_schema(
             r#"
-              enum FurType {
-                  NONE
-                  FLUFFY
-                  BRISTLY
-              }
-
               type Pet {
                   id: ID!
                   name: String!
@@ -900,7 +958,6 @@ mod tests {
                   name: String!
                   favoritePetNames: [String!]
                   pets: [Pet!]!
-                  favoriteFurType: FurType!
                   favoritePet: Pet!
                   leastFavoritePet: Pet @derivedFrom(field: "mostHatedBy")
                   mostFavoritePets: [Pet!] @derivedFrom(field: "mostLovedBy")
@@ -908,20 +965,21 @@ mod tests {
             "#,
         )
         .expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derived API schema");
+        let schema =
+            api_schema(&input_schema, &BTreeSet::new()).expect("Failed to derived API schema");
 
         let user_filter = schema
             .get_named_type("User_filter")
             .expect("User_filter type is missing in derived API schema");
 
-        let user_filter_type = match user_filter {
+        let filter_type = match user_filter {
             TypeDefinition::InputObject(t) => Some(t),
             _ => None,
         }
         .expect("User_filter type is not an input object");
 
         assert_eq!(
-            user_filter_type
+            filter_type
                 .fields
                 .iter()
                 .map(|field| field.name.to_owned())
@@ -944,34 +1002,19 @@ mod tests {
                 "name_in",
                 "name_not_in",
                 "name_contains",
-                "name_contains_nocase",
                 "name_not_contains",
-                "name_not_contains_nocase",
                 "name_starts_with",
-                "name_starts_with_nocase",
                 "name_not_starts_with",
-                "name_not_starts_with_nocase",
                 "name_ends_with",
-                "name_ends_with_nocase",
                 "name_not_ends_with",
-                "name_not_ends_with_nocase",
                 "favoritePetNames",
                 "favoritePetNames_not",
                 "favoritePetNames_contains",
-                "favoritePetNames_contains_nocase",
                 "favoritePetNames_not_contains",
-                "favoritePetNames_not_contains_nocase",
                 "pets",
                 "pets_not",
                 "pets_contains",
-                "pets_contains_nocase",
                 "pets_not_contains",
-                "pets_not_contains_nocase",
-                "pets_",
-                "favoriteFurType",
-                "favoriteFurType_not",
-                "favoriteFurType_in",
-                "favoriteFurType_not_in",
                 "favoritePet",
                 "favoritePet_not",
                 "favoritePet_gt",
@@ -981,243 +1024,16 @@ mod tests {
                 "favoritePet_in",
                 "favoritePet_not_in",
                 "favoritePet_contains",
-                "favoritePet_contains_nocase",
                 "favoritePet_not_contains",
-                "favoritePet_not_contains_nocase",
                 "favoritePet_starts_with",
-                "favoritePet_starts_with_nocase",
                 "favoritePet_not_starts_with",
-                "favoritePet_not_starts_with_nocase",
                 "favoritePet_ends_with",
-                "favoritePet_ends_with_nocase",
                 "favoritePet_not_ends_with",
-                "favoritePet_not_ends_with_nocase",
-                "favoritePet_",
-                "leastFavoritePet_",
-                "mostFavoritePets_",
-                "_change_block"
             ]
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<String>>()
         );
-
-        let pets_field = user_filter_type
-            .fields
-            .iter()
-            .find(|field| field.name == "pets_")
-            .expect("pets_ field is missing");
-
-        assert_eq!(
-            pets_field.value_type.to_string(),
-            String::from("Pet_filter")
-        );
-
-        let pet_filter = schema
-            .get_named_type("Pet_filter")
-            .expect("Pet_filter type is missing in derived API schema");
-
-        let pet_filter_type = match pet_filter {
-            TypeDefinition::InputObject(t) => Some(t),
-            _ => None,
-        }
-        .expect("Pet_filter type is not an input object");
-
-        assert_eq!(
-            pet_filter_type
-                .fields
-                .iter()
-                .map(|field| field.name.to_owned())
-                .collect::<Vec<String>>(),
-            [
-                "id",
-                "id_not",
-                "id_gt",
-                "id_lt",
-                "id_gte",
-                "id_lte",
-                "id_in",
-                "id_not_in",
-                "name",
-                "name_not",
-                "name_gt",
-                "name_lt",
-                "name_gte",
-                "name_lte",
-                "name_in",
-                "name_not_in",
-                "name_contains",
-                "name_contains_nocase",
-                "name_not_contains",
-                "name_not_contains_nocase",
-                "name_starts_with",
-                "name_starts_with_nocase",
-                "name_not_starts_with",
-                "name_not_starts_with_nocase",
-                "name_ends_with",
-                "name_ends_with_nocase",
-                "name_not_ends_with",
-                "name_not_ends_with_nocase",
-                "mostHatedBy",
-                "mostHatedBy_not",
-                "mostHatedBy_contains",
-                "mostHatedBy_contains_nocase",
-                "mostHatedBy_not_contains",
-                "mostHatedBy_not_contains_nocase",
-                "mostHatedBy_",
-                "mostLovedBy",
-                "mostLovedBy_not",
-                "mostLovedBy_contains",
-                "mostLovedBy_contains_nocase",
-                "mostLovedBy_not_contains",
-                "mostLovedBy_not_contains_nocase",
-                "mostLovedBy_",
-                "_change_block"
-            ]
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<String>>()
-        );
-
-        let change_block_filter = user_filter_type
-            .fields
-            .iter()
-            .find(move |p| match p.name.as_str() {
-                "_change_block" => true,
-                _ => false,
-            })
-            .expect("_change_block field is missing in User_filter");
-
-        match &change_block_filter.value_type {
-            Type::NamedType(name) => assert_eq!(name.as_str(), "BlockChangedFilter"),
-            _ => panic!("_change_block field is not a named type"),
-        }
-
-        schema
-            .get_named_type("BlockChangedFilter")
-            .expect("BlockChangedFilter type is missing in derived API schema");
-    }
-
-    #[test]
-    fn api_schema_contains_object_type_with_field_interface() {
-        let input_schema = parse_schema(
-            r#"
-              interface Pet {
-                  id: ID!
-                  name: String!
-              }
-
-              type Dog implements Pet {
-                id: ID!
-                name: String!
-              }
-
-              type Cat implements Pet {
-                id: ID!
-                name: String!
-                owner: User!
-              }
-
-              type User {
-                  id: ID!
-                  name: String!
-                  pets: [Pet!]! @derivedFrom(field: "owner")
-                  favoritePet: Pet!
-              }
-            "#,
-        )
-        .expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derived API schema");
-
-        let user_filter = schema
-            .get_named_type("User_filter")
-            .expect("User_filter type is missing in derived API schema");
-
-        let user_filter_type = match user_filter {
-            TypeDefinition::InputObject(t) => Some(t),
-            _ => None,
-        }
-        .expect("User_filter type is not an input object");
-
-        assert_eq!(
-            user_filter_type
-                .fields
-                .iter()
-                .map(|field| field.name.to_owned())
-                .collect::<Vec<String>>(),
-            [
-                "id",
-                "id_not",
-                "id_gt",
-                "id_lt",
-                "id_gte",
-                "id_lte",
-                "id_in",
-                "id_not_in",
-                "name",
-                "name_not",
-                "name_gt",
-                "name_lt",
-                "name_gte",
-                "name_lte",
-                "name_in",
-                "name_not_in",
-                "name_contains",
-                "name_contains_nocase",
-                "name_not_contains",
-                "name_not_contains_nocase",
-                "name_starts_with",
-                "name_starts_with_nocase",
-                "name_not_starts_with",
-                "name_not_starts_with_nocase",
-                "name_ends_with",
-                "name_ends_with_nocase",
-                "name_not_ends_with",
-                "name_not_ends_with_nocase",
-                "favoritePet",
-                "favoritePet_not",
-                "favoritePet_gt",
-                "favoritePet_lt",
-                "favoritePet_gte",
-                "favoritePet_lte",
-                "favoritePet_in",
-                "favoritePet_not_in",
-                "favoritePet_contains",
-                "favoritePet_contains_nocase",
-                "favoritePet_not_contains",
-                "favoritePet_not_contains_nocase",
-                "favoritePet_starts_with",
-                "favoritePet_starts_with_nocase",
-                "favoritePet_not_starts_with",
-                "favoritePet_not_starts_with_nocase",
-                "favoritePet_ends_with",
-                "favoritePet_ends_with_nocase",
-                "favoritePet_not_ends_with",
-                "favoritePet_not_ends_with_nocase",
-                "_change_block"
-            ]
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<String>>()
-        );
-
-        let change_block_filter = user_filter_type
-            .fields
-            .iter()
-            .find(move |p| match p.name.as_str() {
-                "_change_block" => true,
-                _ => false,
-            })
-            .expect("_change_block field is missing in User_filter");
-
-        match &change_block_filter.value_type {
-            Type::NamedType(name) => assert_eq!(name.as_str(), "BlockChangedFilter"),
-            _ => panic!("_change_block field is not a named type"),
-        }
-
-        schema
-            .get_named_type("BlockChangedFilter")
-            .expect("BlockChangedFilter type is missing in derived API schema");
     }
 
     #[test]
@@ -1226,7 +1042,8 @@ mod tests {
             "type User { id: ID!, name: String! } type UserProfile { id: ID!, title: String! }",
         )
         .expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derive API schema");
+        let schema =
+            api_schema(&input_schema, &BTreeSet::new()).expect("Failed to derive API schema");
 
         let query_type = schema
             .get_named_type("Query")
@@ -1249,11 +1066,7 @@ mod tests {
                 .iter()
                 .map(|input_value| input_value.name.to_owned())
                 .collect::<Vec<String>>(),
-            vec![
-                "id".to_string(),
-                "block".to_string(),
-                "subgraphError".to_string()
-            ],
+            vec!["id".to_string(), "block".to_string()],
         );
 
         let user_plural_field = match query_type {
@@ -1281,8 +1094,7 @@ mod tests {
                 "orderBy",
                 "orderDirection",
                 "where",
-                "block",
-                "subgraphError",
+                "block"
             ]
             .iter()
             .map(ToString::to_string)
@@ -1323,7 +1135,11 @@ mod tests {
             ",
         )
         .expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derived API schema");
+        let schema = api_schema(
+            &input_schema,
+            &BTreeSet::from_iter(Some(SubgraphFeature::NonFatalErrors)),
+        )
+        .expect("Failed to derived API schema");
 
         let query_type = schema
             .get_named_type("Query")
@@ -1412,7 +1228,8 @@ type Gravatar @entity {
 }
 "#;
         let input_schema = parse_schema(SCHEMA).expect("Failed to parse input schema");
-        let schema = api_schema(&input_schema).expect("Failed to derive API schema");
+        let schema =
+            api_schema(&input_schema, &BTreeSet::new()).expect("Failed to derive API schema");
 
         let query_type = schema
             .get_named_type("Query")

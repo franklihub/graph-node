@@ -1,9 +1,35 @@
 use std::collections::VecDeque;
+use std::env;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use lazy_static::lazy_static;
 use prometheus::Gauge;
 
-use crate::prelude::ENV_VARS;
+lazy_static! {
+    pub static ref WINDOW_SIZE: Duration = {
+        let window_size = env::var("GRAPH_LOAD_WINDOW_SIZE")
+            .ok()
+            .map(|s| {
+                u64::from_str(&s).unwrap_or_else(|_| {
+                    panic!("GRAPH_LOAD_WINDOW_SIZE must be a number, but is `{}`", s)
+                })
+            })
+            .unwrap_or(300);
+        Duration::from_secs(window_size)
+    };
+    pub static ref BIN_SIZE: Duration = {
+        let bin_size = env::var("GRAPH_LOAD_BIN_SIZE")
+            .ok()
+            .map(|s| {
+                u64::from_str(&s).unwrap_or_else(|_| {
+                    panic!("GRAPH_LOAD_BIN_SIZE must be a number but is `{}`", s)
+                })
+            })
+            .unwrap_or(1);
+        Duration::from_secs(bin_size)
+    };
+}
 
 /// One bin of durations. The bin starts at time `start`, and we've added `count`
 /// entries to it whose durations add up to `duration`
@@ -69,7 +95,7 @@ pub struct MovingStats {
 /// the environment
 impl Default for MovingStats {
     fn default() -> Self {
-        Self::new(ENV_VARS.load_window_size, ENV_VARS.load_bin_size)
+        Self::new(*WINDOW_SIZE, *BIN_SIZE)
     }
 }
 
@@ -145,9 +171,9 @@ impl MovingStats {
             .map(|existing| now.saturating_duration_since(existing.start) >= self.window_size)
             .unwrap_or(false)
         {
-            if let Some(existing) = self.bins.pop_front() {
+            self.bins.pop_front().map(|existing| {
                 self.total.remove(&existing);
-            }
+            });
         }
     }
 

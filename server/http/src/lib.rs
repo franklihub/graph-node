@@ -12,6 +12,7 @@ mod request;
 mod server;
 mod service;
 
+pub use self::request::GraphQLRequest;
 pub use self::server::GraphQLServer;
 pub use self::service::{GraphQLService, GraphQLServiceResponse};
 

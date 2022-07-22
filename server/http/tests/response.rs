@@ -1,11 +1,12 @@
-use graph::data::value::Object;
 use graph::data::{graphql::object, query::QueryResults};
 use graph::prelude::*;
 use graph_server_http::test_utils;
+use graphql_parser;
+use std::collections::BTreeMap;
 
 #[test]
 fn generates_200_for_query_results() {
-    let data = Object::from_iter([]);
+    let data = BTreeMap::new();
     let query_result = QueryResults::from(data).as_http_response();
     test_utils::assert_expected_headers(&query_result);
     test_utils::assert_successful_response(query_result);
@@ -13,7 +14,7 @@ fn generates_200_for_query_results() {
 
 #[test]
 fn generates_valid_json_for_an_empty_result() {
-    let data = Object::from_iter([]);
+    let data = BTreeMap::new();
     let query_result = QueryResults::from(data).as_http_response();
     test_utils::assert_expected_headers(&query_result);
     let data = test_utils::assert_successful_response(query_result);
@@ -29,10 +30,10 @@ fn canonical_serialization() {
                 // get amended if q::Value ever gets more variants
                 // The order of the variants should be the same as the
                 // order of the tests below
-                use r::Value::*;
+                use graphql_parser::query::Value::*;
                 let _ = match $obj {
-                    Object(_) | List(_) | Enum(_) | Null | Int(_) | Float(_) | String(_)
-                    | Boolean(_) => (),
+                    Variable(_) | Object(_) | List(_) | Enum(_) | Null | Int(_) | Float(_)
+                    | String(_) | Boolean(_) => (),
                 };
             }
             let res = QueryResult::try_from($obj).unwrap();
@@ -43,11 +44,10 @@ fn canonical_serialization() {
 
     // Value::Variable: nothing to check, not used in a response
 
-    // Value::Object: Insertion order of keys matters
+    // Value::Object: Insertion order of keys does not matter
     let first_second = r#"{"data":{"first":"first","second":"second"}}"#;
-    let second_first = r#"{"data":{"second":"second","first":"first"}}"#;
     assert_resp!(first_second, object! { first: "first", second: "second" });
-    assert_resp!(second_first, object! { second: "second", first: "first" });
+    assert_resp!(first_second, object! { second: "second", first: "first" });
 
     // Value::List
     assert_resp!(r#"{"data":{"ary":[1,2]}}"#, object! { ary: vec![1,2] });
@@ -55,13 +55,13 @@ fn canonical_serialization() {
     // Value::Enum
     assert_resp!(
         r#"{"data":{"enum_field":"enum"}}"#,
-        object! { enum_field:  r::Value::Enum("enum".to_owned())}
+        object! { enum_field:  q::Value::Enum("enum".to_owned())}
     );
 
     // Value::Null
     assert_resp!(
         r#"{"data":{"nothing":null}}"#,
-        object! { nothing:  r::Value::Null}
+        object! { nothing:  q::Value::Null}
     );
 
     // Value::Int
@@ -82,6 +82,6 @@ fn canonical_serialization() {
     // Value::Boolean
     assert_resp!(
         r#"{"data":{"no":false,"yes":true}}"#,
-        object! { no: false, yes: true }
+        object! { yes: true, no: false }
     );
 }

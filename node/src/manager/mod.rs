@@ -1,7 +1,5 @@
-use std::collections::BTreeSet;
-
 use graph::{
-    components::store::{SubscriptionManager, UnitStream},
+    components::store::SubscriptionManager,
     prelude::{StoreEventStreamBox, SubscriptionFilter},
 };
 
@@ -14,11 +12,7 @@ mod display;
 pub struct PanicSubscriptionManager;
 
 impl SubscriptionManager for PanicSubscriptionManager {
-    fn subscribe(&self, _: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox {
+    fn subscribe(&self, _: Vec<SubscriptionFilter>) -> StoreEventStreamBox {
         panic!("we were never meant to call `subscribe`");
-    }
-
-    fn subscribe_no_payload(&self, _: BTreeSet<SubscriptionFilter>) -> UnitStream {
-        panic!("we were never meant to call `subscribe_no_payload`");
     }
 }

@@ -6,7 +6,7 @@ use graph::{
     prelude::{
         anyhow::{anyhow, bail, Error},
         chrono::{DateTime, Duration, SecondsFormat, Utc},
-        BlockPtr, ChainStore, DeploymentHash, NodeId, QueryStoreManager,
+        BlockPtr, ChainStore, NodeId, QueryStoreManager,
     },
 };
 use graph_store_postgres::{
@@ -15,7 +15,7 @@ use graph_store_postgres::{
 };
 use graph_store_postgres::{connection_pool::ConnectionPool, Shard, Store, SubgraphStore};
 
-use crate::manager::deployment::DeploymentSearch;
+use crate::manager::deployment;
 use crate::manager::display::List;
 
 type UtcDateTime = DateTime<Utc>;
@@ -25,7 +25,6 @@ type UtcDateTime = DateTime<Utc>;
 struct CopyState {
     src: i32,
     dst: i32,
-    #[allow(dead_code)]
     target_block_hash: Vec<u8>,
     target_block_number: i32,
     started_at: UtcDateTime,
@@ -36,15 +35,12 @@ struct CopyState {
 #[derive(Queryable, QueryableByName, Debug)]
 #[table_name = "copy_table_state"]
 struct CopyTableState {
-    #[allow(dead_code)]
     id: i32,
     entity_type: String,
-    #[allow(dead_code)]
     dst: i32,
     next_vid: i64,
     target_vid: i64,
     batch_size: i64,
-    #[allow(dead_code)]
     started_at: UtcDateTime,
     finished_at: Option<UtcDateTime>,
     duration_ms: i64,
@@ -80,20 +76,19 @@ impl CopyState {
 
 pub async fn create(
     store: Arc<Store>,
-    primary: ConnectionPool,
-    src: DeploymentSearch,
+    src: String,
+    src_shard: Option<String>,
     shard: String,
-    shards: Vec<String>,
     node: String,
     block_offset: u32,
 ) -> Result<(), Error> {
     let block_offset = block_offset as i32;
     let subgraph_store = store.subgraph_store();
-    let src = src.locate_unique(&primary)?;
+    let src = deployment::locate(subgraph_store.as_ref(), src, src_shard)?;
     let query_store = store.query_store(src.hash.clone().into(), true).await?;
     let network = query_store.network_name();
 
-    let src_ptr = query_store.block_ptr().await?.ok_or_else(|| anyhow!("subgraph {} has not indexed any blocks yet and can not be used as the source of a copy", src))?;
+    let src_ptr = query_store.block_ptr()?.ok_or_else(|| anyhow!("subgraph {} has not indexed any blocks yet and can not be used as the source of a copy", src))?;
     let src_number = if src_ptr.number <= block_offset {
         bail!("subgraph {} has only indexed up to block {}, but we need at least block {} before we can copy from it", src, src_ptr.number, block_offset);
     } else {
@@ -104,27 +99,21 @@ pub async fn create(
         .block_store()
         .chain_store(&network)
         .ok_or_else(|| anyhow!("could not find chain store for network {}", network))?;
-    let mut hashes = chain_store.block_hashes_by_block_number(src_number)?;
+    let hashes = chain_store.block_hashes_by_block_number(src_number)?;
     let hash = match hashes.len() {
         0 => bail!(
             "could not find a block with number {} in our cache",
             src_number
         ),
-        1 => hashes.pop().unwrap(),
+        1 => hashes[0],
         n => bail!(
             "the cache contains {} hashes for block number {}",
             n,
             src_number
         ),
     };
-    let base_ptr = BlockPtr::new(hash, src_number);
+    let base_ptr = BlockPtr::from((hash, src_number));
 
-    if !shards.contains(&shard) {
-        bail!(
-            "unknown shard {shard}, only shards {} are configured",
-            shards.join(", ")
-        )
-    }
     let shard = Shard::new(shard)?;
     let node = NodeId::new(node.clone()).map_err(|()| anyhow!("invalid node id `{}`", node))?;
 
@@ -136,8 +125,7 @@ pub async fn create(
 
 pub fn activate(store: Arc<SubgraphStore>, deployment: String, shard: String) -> Result<(), Error> {
     let shard = Shard::new(shard)?;
-    let deployment =
-        DeploymentHash::new(deployment).map_err(|s| anyhow!("illegal deployment hash `{}`", s))?;
+    let deployment = deployment::as_hash(deployment)?;
     let deployment = store
         .locate_in_shard(&deployment, shard.clone())?
         .ok_or_else(|| {
@@ -210,7 +198,7 @@ pub fn list(pools: HashMap<Shard, ConnectionPool>) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: &DeploymentSearch) -> Result<(), Error> {
+pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: i32) -> Result<(), Error> {
     use catalog::active_copies as ac;
     use catalog::deployment_schemas as ds;
 
@@ -242,7 +230,6 @@ pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: &DeploymentSearch) -> 
         .get(&*PRIMARY_SHARD)
         .ok_or_else(|| anyhow!("can not find deployment with id {}", dst))?;
     let pconn = primary.get()?;
-    let dst = dst.locate_unique(&primary)?.id.0;
 
     let (shard, deployment) = ds::table
         .filter(ds::id.eq(dst as i32))

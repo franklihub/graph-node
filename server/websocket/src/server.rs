@@ -130,7 +130,7 @@ where
                 let state = tokio::task::block_in_place(|| {
                     graph::block_on(Self::subgraph_id_from_url_path(
                         store.clone(),
-                        path,
+                        path.as_ref(),
                     ))
                 })
                 .map_err(|e| {

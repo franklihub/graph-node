@@ -1,6 +1,7 @@
 use super::ProofOfIndexingEvent;
 use crate::prelude::DeploymentHash;
-use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
+use stable_hash::prelude::*;
+use stable_hash::utils::AsBytes;
 use std::collections::HashMap;
 use web3::types::{Address, H256};
 
@@ -16,30 +17,27 @@ pub struct PoI<'a> {
     pub indexer: Option<Address>,
 }
 
-fn h256_as_bytes(val: &H256) -> AsBytes<&[u8]> {
-    AsBytes(val.as_bytes())
+impl StableHash for PoI<'_> {
+    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+        self.causality_regions
+            .stable_hash(sequence_number.next_child(), state);
+        self.subgraph_id
+            .stable_hash(sequence_number.next_child(), state);
+        AsBytes(self.block_hash.as_bytes()).stable_hash(sequence_number.next_child(), state);
+        self.indexer
+            .as_ref()
+            .map(|i| AsBytes(i.as_bytes()))
+            .stable_hash(sequence_number.next_child(), state);
+    }
 }
-
-fn indexer_opt_as_bytes(val: &Option<Address>) -> Option<AsBytes<&[u8]>> {
-    val.as_ref().map(|v| AsBytes(v.as_bytes()))
-}
-
-impl_stable_hash!(PoI<'_> {
-    causality_regions,
-    subgraph_id,
-    block_hash: h256_as_bytes,
-    indexer: indexer_opt_as_bytes
-});
 
 pub struct CausalityRegion<'a> {
     pub blocks: Vec<Block<'a>>,
 }
 
-impl_stable_hash!(CausalityRegion<'_> {blocks});
-
-impl CausalityRegion<'_> {
-    pub fn from_network(network: &str) -> String {
-        format!("ethereum/{}", network)
+impl StableHash for CausalityRegion<'_> {
+    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+        self.blocks.stable_hash(sequence_number.next_child(), state);
     }
 }
 
@@ -48,4 +46,8 @@ pub struct Block<'a> {
     pub events: Vec<ProofOfIndexingEvent<'a>>,
 }
 
-impl_stable_hash!(Block<'_> {events});
+impl StableHash for Block<'_> {
+    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+        self.events.stable_hash(sequence_number.next_child(), state);
+    }
+}

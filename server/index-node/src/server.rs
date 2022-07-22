@@ -4,8 +4,7 @@ use hyper::Server;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use graph::{
-    blockchain::BlockchainMap,
-    components::store::Store,
+    components::store::StatusStore,
     prelude::{IndexNodeServer as IndexNodeServerTrait, *},
 };
 
@@ -26,22 +25,22 @@ impl From<hyper::Error> for IndexNodeServeError {
 }
 
 /// A GraphQL server based on Hyper.
-pub struct IndexNodeServer<Q, S> {
+pub struct IndexNodeServer<Q, S, R, St> {
     logger: Logger,
-    blockchain_map: Arc<BlockchainMap>,
     graphql_runner: Arc<Q>,
     store: Arc<S>,
-    link_resolver: Arc<dyn LinkResolver>,
+    link_resolver: Arc<R>,
+    subgraph_store: Arc<St>,
 }
 
-impl<Q, S> IndexNodeServer<Q, S> {
+impl<Q, S, R, St> IndexNodeServer<Q, S, R, St> {
     /// Creates a new GraphQL server.
     pub fn new(
         logger_factory: &LoggerFactory,
-        blockchain_map: Arc<BlockchainMap>,
         graphql_runner: Arc<Q>,
         store: Arc<S>,
-        link_resolver: Arc<dyn LinkResolver>,
+        link_resolver: Arc<R>,
+        subgraph_store: Arc<St>,
     ) -> Self {
         let logger = logger_factory.component_logger(
             "IndexNodeServer",
@@ -54,18 +53,20 @@ impl<Q, S> IndexNodeServer<Q, S> {
 
         IndexNodeServer {
             logger,
-            blockchain_map,
             graphql_runner,
             store,
             link_resolver,
+            subgraph_store,
         }
     }
 }
 
-impl<Q, S> IndexNodeServerTrait for IndexNodeServer<Q, S>
+impl<Q, S, R, St> IndexNodeServerTrait for IndexNodeServer<Q, S, R, St>
 where
     Q: GraphQlRunner,
-    S: Store,
+    S: StatusStore,
+    R: LinkResolver,
+    St: SubgraphStore,
 {
     type ServeError = IndexNodeServeError;
 
@@ -89,10 +90,10 @@ where
         let store = self.store.clone();
         let service = IndexNodeService::new(
             logger_for_service.clone(),
-            self.blockchain_map.clone(),
             graphql_runner.clone(),
             store.clone(),
             self.link_resolver.clone(),
+            self.subgraph_store.clone(),
         );
         let new_service =
             make_service_fn(move |_| futures03::future::ok::<_, Error>(service.clone()));

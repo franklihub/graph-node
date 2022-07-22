@@ -17,12 +17,3 @@ pub mod cache_weight;
 pub mod timed_rw_lock;
 
 pub mod jobs;
-
-/// Increasingly longer sleeps to back off some repeated operation
-pub mod backoff;
-
-pub mod bounded_queue;
-
-pub mod stable_hash_glue;
-
-pub mod mem;

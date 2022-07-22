@@ -2,7 +2,18 @@ use parking_lot::{Mutex, RwLock};
 use slog::{warn, Logger};
 use std::time::{Duration, Instant};
 
-use crate::prelude::ENV_VARS;
+lazy_static::lazy_static! {
+    /// If an instrumented lock is contended for longer than the specified duration, a warning will
+    /// be logged. Environment variable specified in milliseconds. Defaults to 100ms.
+    static ref LOCK_CONTENTION_LOG_THRESHOLD: Duration = {
+        Duration::from_millis(
+            std::env::var("GRAPH_LOCK_CONTENTION_LOG_THRESHOLD_MS")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse::<u64>()
+                .expect("Invalid value for LOCK_CONTENTION_LOG_THRESHOLD_MS environment variable")
+       )
+    };
+}
 
 /// Adds instrumentation for timing the performance of the lock.
 pub struct TimedRwLock<T> {
@@ -16,40 +27,34 @@ impl<T> TimedRwLock<T> {
         TimedRwLock {
             id: id.into(),
             lock: RwLock::new(x),
-            log_threshold: ENV_VARS.lock_contention_log_threshold,
+            log_threshold: *LOCK_CONTENTION_LOG_THRESHOLD,
         }
     }
 
     pub fn write(&self, logger: &Logger) -> parking_lot::RwLockWriteGuard<T> {
-        loop {
-            let mut elapsed = Duration::from_secs(0);
-            match self.lock.try_write_for(self.log_threshold) {
-                Some(guard) => break guard,
-                None => {
-                    elapsed += self.log_threshold;
-                    warn!(logger, "Write lock taking a long time to acquire";
-                                  "id" => &self.id,
-                                  "wait_ms" => elapsed.as_millis(),
-                    );
-                }
-            }
+        let start = Instant::now();
+        let guard = self.lock.write();
+        let elapsed = start.elapsed();
+        if elapsed > self.log_threshold {
+            warn!(logger, "Write lock took a long time to acquire";
+                          "id" => &self.id,
+                          "wait_ms" => elapsed.as_millis(),
+            );
         }
+        guard
     }
 
     pub fn read(&self, logger: &Logger) -> parking_lot::RwLockReadGuard<T> {
-        loop {
-            let mut elapsed = Duration::from_secs(0);
-            match self.lock.try_read_for(self.log_threshold) {
-                Some(guard) => break guard,
-                None => {
-                    elapsed += self.log_threshold;
-                    warn!(logger, "Read lock taking a long time to acquire";
-                                  "id" => &self.id,
-                                  "wait_ms" => elapsed.as_millis(),
-                    );
-                }
-            }
+        let start = Instant::now();
+        let guard = self.lock.read();
+        let elapsed = start.elapsed();
+        if elapsed > self.log_threshold {
+            warn!(logger, "Read lock took a long time to acquire";
+                          "id" => &self.id,
+                          "wait_ms" => elapsed.as_millis(),
+            );
         }
+        guard
     }
 }
 
@@ -65,7 +70,7 @@ impl<T> TimedMutex<T> {
         TimedMutex {
             id: id.into(),
             lock: Mutex::new(x),
-            log_threshold: ENV_VARS.lock_contention_log_threshold,
+            log_threshold: *LOCK_CONTENTION_LOG_THRESHOLD,
         }
     }
 

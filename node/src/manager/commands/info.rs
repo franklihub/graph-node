@@ -3,19 +3,20 @@ use std::sync::Arc;
 use graph::{components::store::StatusStore, data::subgraph::status, prelude::anyhow};
 use graph_store_postgres::{connection_pool::ConnectionPool, Store};
 
-use crate::manager::deployment::{Deployment, DeploymentSearch};
+use crate::manager::deployment::Deployment;
 
 fn find(
     pool: ConnectionPool,
-    search: DeploymentSearch,
+    name: String,
     current: bool,
     pending: bool,
     used: bool,
 ) -> Result<Vec<Deployment>, anyhow::Error> {
+    let conn = pool.get()?;
     let current = current || used;
     let pending = pending || used;
 
-    let deployments = search.lookup(&pool)?;
+    let deployments = Deployment::lookup(&conn, name)?;
     // Filter by status; if neither `current` or `pending` are set, list
     // all deployments
     let deployments: Vec<_> = deployments
@@ -33,12 +34,12 @@ fn find(
 pub fn run(
     pool: ConnectionPool,
     store: Option<Arc<Store>>,
-    search: DeploymentSearch,
+    name: String,
     current: bool,
     pending: bool,
     used: bool,
 ) -> Result<(), anyhow::Error> {
-    let deployments = find(pool, search, current, pending, used)?;
+    let deployments = find(pool, name, current, pending, used)?;
     let ids: Vec<_> = deployments.iter().map(|d| d.locator().id).collect();
     let statuses = match store {
         Some(store) => store.status(status::Filter::DeploymentIds(ids))?,

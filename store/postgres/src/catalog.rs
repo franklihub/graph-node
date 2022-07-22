@@ -1,4 +1,4 @@
-use diesel::sql_types::{Bool, Integer};
+use diesel::sql_types::Integer;
 use diesel::{connection::SimpleConnection, prelude::RunQueryDsl, select};
 use diesel::{insert_into, OptionalExtension};
 use diesel::{pg::PgConnection, sql_query};
@@ -47,64 +47,26 @@ table! {
     }
 }
 
-// In debug builds (for testing etc.) create exclusion constraints, in
-// release builds for production, skip them
-#[cfg(debug_assertions)]
-const CREATE_EXCLUSION_CONSTRAINT: bool = true;
-#[cfg(not(debug_assertions))]
-const CREATE_EXCLUSION_CONSTRAINT: bool = false;
-
 /// Information about what tables and columns we have in the database
 #[derive(Debug, Clone)]
 pub struct Catalog {
     pub site: Arc<Site>,
     text_columns: HashMap<String, HashSet<String>>,
-    pub use_poi: bool,
-    /// Whether `bytea` columns are indexed with just a prefix (`true`) or
-    /// in their entirety. This influences both DDL generation and how
-    /// queries are generated
-    pub use_bytea_prefix: bool,
 }
 
 impl Catalog {
-    /// Load the catalog for an existing subgraph
-    pub fn load(
-        conn: &PgConnection,
-        site: Arc<Site>,
-        use_bytea_prefix: bool,
-    ) -> Result<Self, StoreError> {
+    pub fn new(conn: &PgConnection, site: Arc<Site>) -> Result<Self, StoreError> {
         let text_columns = get_text_columns(conn, &site.namespace)?;
-        let use_poi = supports_proof_of_indexing(conn, &site.namespace)?;
-        Ok(Catalog {
-            site,
-            text_columns,
-            use_poi,
-            use_bytea_prefix,
-        })
-    }
-
-    /// Return a new catalog suitable for creating a new subgraph
-    pub fn for_creation(site: Arc<Site>) -> Self {
-        Catalog {
-            site,
-            text_columns: HashMap::default(),
-            // DDL generation creates a POI table
-            use_poi: true,
-            // DDL generation creates indexes for prefixes of bytes columns
-            // see: attr-bytea-prefix
-            use_bytea_prefix: true,
-        }
+        Ok(Catalog { site, text_columns })
     }
 
     /// Make a catalog as if the given `schema` did not exist in the database
     /// yet. This function should only be used in situations where a database
     /// connection is definitely not available, such as in unit tests
-    pub fn for_tests(site: Arc<Site>) -> Result<Self, StoreError> {
+    pub fn make_empty(site: Arc<Site>) -> Result<Self, StoreError> {
         Ok(Catalog {
             site,
             text_columns: HashMap::default(),
-            use_poi: false,
-            use_bytea_prefix: true,
         })
     }
 
@@ -115,12 +77,6 @@ impl Catalog {
             .get(table.as_str())
             .map(|cols| cols.contains(column.as_str()))
             .unwrap_or(false)
-    }
-
-    /// Whether to create exclusion indexes; if false, create gist indexes
-    /// w/o an exclusion constraint
-    pub fn create_exclusion_constraint(&self) -> bool {
-        CREATE_EXCLUSION_CONSTRAINT
     }
 }
 
@@ -161,7 +117,6 @@ pub fn supports_proof_of_indexing(
     #[derive(Debug, QueryableByName)]
     struct Table {
         #[sql_type = "Text"]
-        #[allow(dead_code)]
         pub table_name: String,
     }
     let query =
@@ -347,7 +302,7 @@ pub(crate) mod table_schema {
                 _ => ci.data_type.clone(),
             };
             Self {
-                column_name: ci.column_name,
+                column_name: ci.column_name.clone(),
                 data_type,
             }
         }
@@ -425,79 +380,4 @@ pub fn create_foreign_table(
         )
     })?;
     Ok(query)
-}
-
-/// Checks in the database if a given index is valid.
-pub(crate) fn check_index_is_valid(
-    conn: &PgConnection,
-    schema_name: &str,
-    index_name: &str,
-) -> Result<bool, StoreError> {
-    #[derive(Queryable, QueryableByName)]
-    struct ManualIndexCheck {
-        #[sql_type = "Bool"]
-        is_valid: bool,
-    }
-
-    let query = "
-        select
-            i.indisvalid as is_valid
-        from
-            pg_class c
-            join pg_index i on i.indexrelid = c.oid
-            join pg_namespace n on c.relnamespace = n.oid
-        where
-            n.nspname = $1
-            and c.relname = $2";
-    let result = sql_query(query)
-        .bind::<Text, _>(schema_name)
-        .bind::<Text, _>(index_name)
-        .get_result::<ManualIndexCheck>(conn)
-        .optional()
-        .map_err::<StoreError, _>(Into::into)?
-        .map(|check| check.is_valid);
-    Ok(matches!(result, Some(true)))
-}
-
-pub(crate) fn indexes_for_table(
-    conn: &PgConnection,
-    schema_name: &str,
-    table_name: &str,
-) -> Result<Vec<String>, StoreError> {
-    #[derive(Queryable, QueryableByName)]
-    struct IndexName {
-        #[sql_type = "Text"]
-        #[column_name = "indexdef"]
-        def: String,
-    }
-
-    let query = "
-        select
-            indexdef
-        from
-            pg_indexes
-        where
-            schemaname = $1
-            and tablename = $2
-        order by indexname";
-    let results = sql_query(query)
-        .bind::<Text, _>(schema_name)
-        .bind::<Text, _>(table_name)
-        .load::<IndexName>(conn)
-        .map_err::<StoreError, _>(Into::into)?;
-
-    Ok(results.into_iter().map(|i| i.def).collect())
-}
-pub(crate) fn drop_index(
-    conn: &PgConnection,
-    schema_name: &str,
-    index_name: &str,
-) -> Result<(), StoreError> {
-    let query = format!("drop index concurrently {schema_name}.{index_name}");
-    sql_query(&query)
-        .bind::<Text, _>(schema_name)
-        .bind::<Text, _>(index_name)
-        .execute(conn)
-        .map_err::<StoreError, _>(Into::into)?;
-    Ok(())
 }

@@ -1,8 +1,6 @@
-use std::str::FromStr;
-
 use async_trait::async_trait;
 
-use crate::{components::store::DeploymentLocator, prelude::*};
+use crate::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
 pub enum SubgraphVersionSwitchingMode {
@@ -12,18 +10,10 @@ pub enum SubgraphVersionSwitchingMode {
 
 impl SubgraphVersionSwitchingMode {
     pub fn parse(mode: &str) -> Self {
-        Self::from_str(mode).unwrap()
-    }
-}
-
-impl FromStr for SubgraphVersionSwitchingMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "instant" => Ok(SubgraphVersionSwitchingMode::Instant),
-            "synced" => Ok(SubgraphVersionSwitchingMode::Synced),
-            _ => Err(format!("invalid version switching mode: {:?}", s)),
+        match mode.to_ascii_lowercase().as_str() {
+            "instant" => SubgraphVersionSwitchingMode::Instant,
+            "synced" => SubgraphVersionSwitchingMode::Synced,
+            _ => panic!("invalid version switching mode: {:?}", mode),
         }
     }
 }
@@ -41,9 +31,7 @@ pub trait SubgraphRegistrar: Send + Sync + 'static {
         name: SubgraphName,
         hash: DeploymentHash,
         assignment_node_id: NodeId,
-        debug_fork: Option<DeploymentHash>,
-        start_block: Option<BlockPtr>,
-    ) -> Result<DeploymentLocator, SubgraphRegistrarError>;
+    ) -> Result<(), SubgraphRegistrarError>;
 
     async fn remove_subgraph(&self, name: SubgraphName) -> Result<(), SubgraphRegistrarError>;
 

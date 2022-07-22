@@ -1,17 +1,14 @@
+use futures::sync::mpsc::{channel, Sender};
 use futures03::TryStreamExt;
-use graph::parking_lot::Mutex;
 use graph::tokio_stream::wrappers::ReceiverStream;
-use std::collections::BTreeSet;
 use std::sync::{atomic::Ordering, Arc, RwLock};
 use std::{collections::HashMap, sync::atomic::AtomicUsize};
-use tokio::sync::mpsc::{channel, Sender};
-use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::notification_listener::{NotificationListener, SafeChannelName};
-use graph::components::store::{SubscriptionManager as SubscriptionManagerTrait, UnitStream};
+use graph::components::store::SubscriptionManager as SubscriptionManagerTrait;
 use graph::prelude::serde_json;
-use graph::{prelude::*, tokio_stream};
+use graph::prelude::*;
 
 pub struct StoreEventListener {
     notification_listener: NotificationListener,
@@ -21,20 +18,12 @@ impl StoreEventListener {
     pub fn new(
         logger: Logger,
         postgres_url: String,
-        registry: Arc<dyn MetricsRegistry>,
     ) -> (Self, Box<dyn Stream<Item = StoreEvent, Error = ()> + Send>) {
-        let channel = SafeChannelName::i_promise_this_is_safe("store_events");
-        let (notification_listener, receiver) =
-            NotificationListener::new(&logger, postgres_url, channel.clone());
-
-        let counter = registry
-            .global_counter_vec(
-                "notification_queue_recvd",
-                "Number of messages received through Postgres LISTEN",
-                vec!["channel", "network"].as_slice(),
-            )
-            .unwrap()
-            .with_label_values(&[channel.as_str(), "none"]);
+        let (notification_listener, receiver) = NotificationListener::new(
+            &logger,
+            postgres_url,
+            SafeChannelName::i_promise_this_is_safe("store_events"),
+        );
 
         let event_stream = Box::new(
             ReceiverStream::new(receiver)
@@ -66,7 +55,6 @@ impl StoreEventListener {
                         },
                         |change| {
                             num_valid.fetch_add(1, Ordering::SeqCst);
-                            counter.inc();
                             Some(change)
                         },
                     )
@@ -86,57 +74,20 @@ impl StoreEventListener {
     }
 }
 
-struct Watcher<T> {
-    sender: Arc<watch::Sender<T>>,
-    receiver: watch::Receiver<T>,
-}
-
-impl<T: Clone + Debug + Send + Sync + 'static> Watcher<T> {
-    fn new(init: T) -> Self {
-        let (sender, receiver) = watch::channel(init);
-        Watcher {
-            sender: Arc::new(sender),
-            receiver,
-        }
-    }
-
-    fn send(&self, v: T) {
-        // Unwrap: `self` holds a receiver.
-        self.sender.send(v).unwrap()
-    }
-
-    fn stream(&self) -> Box<dyn futures03::Stream<Item = T> + Unpin + Send + Sync> {
-        Box::new(tokio_stream::wrappers::WatchStream::new(
-            self.receiver.clone(),
-        ))
-    }
-
-    /// Outstanding receivers returned from `Self::stream`.
-    fn receiver_count(&self) -> usize {
-        // Do not count the internal receiver.
-        self.sender.receiver_count() - 1
-    }
-}
-
 /// Manage subscriptions to the `StoreEvent` stream. Keep a list of
 /// currently active subscribers and forward new events to each of them
 pub struct SubscriptionManager {
-    // These are more efficient since only one entry is stored per filter.
-    subscriptions_no_payload: Arc<Mutex<HashMap<BTreeSet<SubscriptionFilter>, Watcher<()>>>>,
-
-    subscriptions:
-        Arc<RwLock<HashMap<String, (Arc<BTreeSet<SubscriptionFilter>>, Sender<Arc<StoreEvent>>)>>>,
+    subscriptions: Arc<RwLock<HashMap<String, Sender<Arc<StoreEvent>>>>>,
 
     /// Keep the notification listener alive
     listener: StoreEventListener,
 }
 
 impl SubscriptionManager {
-    pub fn new(logger: Logger, postgres_url: String, registry: Arc<dyn MetricsRegistry>) -> Self {
-        let (listener, store_events) = StoreEventListener::new(logger, postgres_url, registry);
+    pub fn new(logger: Logger, postgres_url: String) -> Self {
+        let (listener, store_events) = StoreEventListener::new(logger, postgres_url);
 
         let mut manager = SubscriptionManager {
-            subscriptions_no_payload: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             listener,
         };
@@ -157,93 +108,60 @@ impl SubscriptionManager {
         &self,
         store_events: Box<dyn Stream<Item = StoreEvent, Error = ()> + Send>,
     ) {
-        let subscriptions = self.subscriptions.cheap_clone();
-        let subscriptions_no_payload = self.subscriptions_no_payload.cheap_clone();
-        let mut store_events = store_events.compat();
+        let subscriptions = self.subscriptions.clone();
 
         // This channel is constantly receiving things and there are locks involved,
         // so it's best to use a blocking task.
-        graph::spawn_blocking(async move {
-            while let Some(Ok(event)) = store_events.next().await {
-                let event = Arc::new(event);
-
-                // Send to `subscriptions`.
-                {
+        graph::spawn_blocking(
+            store_events
+                .for_each(move |event| {
                     let senders = subscriptions.read().unwrap().clone();
+                    let subscriptions = subscriptions.clone();
+                    let event = Arc::new(event);
 
                     // Write change to all matching subscription streams; remove subscriptions
                     // whose receiving end has been dropped
-                    for (id, (_, sender)) in senders
-                        .iter()
-                        .filter(|(_, (filter, _))| event.matches(filter))
-                    {
-                        if sender.send(event.cheap_clone()).await.is_err() {
-                            // Receiver was dropped
-                            subscriptions.write().unwrap().remove(id);
-                        }
-                    }
-                }
+                    stream::iter_ok::<_, ()>(senders).for_each(move |(id, sender)| {
+                        let subscriptions = subscriptions.clone();
 
-                // Send to `subscriptions_no_payload`.
-                {
-                    let watchers = subscriptions_no_payload.lock();
-
-                    // Write change to all matching subscription streams
-                    for (_, watcher) in watchers.iter().filter(|(filter, _)| event.matches(filter))
-                    {
-                        watcher.send(());
-                    }
-                }
-            }
-        });
+                        sender.send(event.cheap_clone()).then(move |result| {
+                            match result {
+                                Err(_send_error) => {
+                                    // Receiver was dropped
+                                    subscriptions.write().unwrap().remove(&id);
+                                    Ok(())
+                                }
+                                Ok(_sender) => Ok(()),
+                            }
+                        })
+                    })
+                })
+                .compat(),
+        );
     }
 
     fn periodically_clean_up_stale_subscriptions(&self) {
-        let subscriptions = self.subscriptions.cheap_clone();
-        let subscriptions_no_payload = self.subscriptions_no_payload.cheap_clone();
+        let subscriptions = self.subscriptions.clone();
 
         // Clean up stale subscriptions every 5s
         graph::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
+                let mut subscriptions = subscriptions.write().unwrap();
 
-                // Cleanup `subscriptions`.
-                {
-                    let mut subscriptions = subscriptions.write().unwrap();
+                // Obtain IDs of subscriptions whose receiving end has gone
+                let stale_ids = subscriptions
+                    .iter_mut()
+                    .filter_map(|(id, sender)| match sender.poll_ready() {
+                        Err(_) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
 
-                    // Obtain IDs of subscriptions whose receiving end has gone
-                    let stale_ids = subscriptions
-                        .iter_mut()
-                        .filter_map(|(id, (_, sender))| match sender.is_closed() {
-                            true => Some(id.clone()),
-                            false => None,
-                        })
-                        .collect::<Vec<_>>();
-
-                    // Remove all stale subscriptions
-                    for id in stale_ids {
-                        subscriptions.remove(&id);
-                    }
-                }
-
-                // Cleanup `subscriptions_no_payload`.
-                {
-                    let mut subscriptions = subscriptions_no_payload.lock();
-
-                    // Obtain IDs of subscriptions whose receiving end has gone
-                    let stale_ids = subscriptions
-                        .iter_mut()
-                        .filter_map(|(id, watcher)| match watcher.receiver_count() == 0 {
-                            true => Some(id.clone()),
-                            false => None,
-                        })
-                        .collect::<Vec<_>>();
-
-                    // Remove all stale subscriptions
-                    for id in stale_ids {
-                        subscriptions.remove(&id);
-                    }
+                // Remove all stale subscriptions
+                for id in stale_ids {
+                    subscriptions.remove(&id);
                 }
             }
         });
@@ -251,28 +169,16 @@ impl SubscriptionManager {
 }
 
 impl SubscriptionManagerTrait for SubscriptionManager {
-    fn subscribe(&self, entities: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox {
+    fn subscribe(&self, entities: Vec<SubscriptionFilter>) -> StoreEventStreamBox {
         let id = Uuid::new_v4().to_string();
 
         // Prepare the new subscription by creating a channel and a subscription object
         let (sender, receiver) = channel(100);
 
         // Add the new subscription
-        self.subscriptions
-            .write()
-            .unwrap()
-            .insert(id, (Arc::new(entities.clone()), sender));
+        self.subscriptions.write().unwrap().insert(id, sender);
 
         // Return the subscription ID and entity change stream
-        StoreEventStream::new(Box::new(ReceiverStream::new(receiver).map(Ok).compat()))
-            .filter_by_entities(entities)
-    }
-
-    fn subscribe_no_payload(&self, entities: BTreeSet<SubscriptionFilter>) -> UnitStream {
-        self.subscriptions_no_payload
-            .lock()
-            .entry(entities)
-            .or_insert_with(|| Watcher::new(()))
-            .stream()
+        StoreEventStream::new(Box::new(receiver)).filter_by_entities(entities)
     }
 }

@@ -1,98 +1,101 @@
-use graph::components::store::UnitStream;
-use graph::prelude::{async_trait, s, tokio, ApiSchema, Error, QueryExecutionError};
-use graph::{
-    data::graphql::ObjectOrInterface,
-    prelude::{r, QueryResult},
-};
+use std::collections::HashMap;
 
-use crate::execution::{ast as a, ExecutionContext};
+use crate::execution::ExecutionContext;
+use graph::prelude::{async_trait, q, s, tokio, Error, QueryExecutionError, StoreEventStreamBox};
+use graph::{
+    data::graphql::{ext::DocumentExt, ObjectOrInterface},
+    prelude::QueryResult,
+};
 
 /// A GraphQL resolver that can resolve entities, enum values, scalar types and interfaces/unions.
 #[async_trait]
 pub trait Resolver: Sized + Send + Sync + 'static {
     const CACHEABLE: bool;
 
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError>;
+    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
 
     /// Prepare for executing a query by prefetching as much data as possible
     fn prefetch(
         &self,
         ctx: &ExecutionContext<Self>,
-        selection_set: &a::SelectionSet,
-    ) -> Result<Option<r::Value>, Vec<QueryExecutionError>>;
+        selection_set: &q::SelectionSet,
+    ) -> Result<Option<q::Value>, Vec<QueryExecutionError>>;
 
     /// Resolves list of objects, `prefetched_objects` is `Some` if the parent already calculated the value.
     fn resolve_objects(
         &self,
-        prefetched_objects: Option<r::Value>,
-        field: &a::Field,
+        prefetched_objects: Option<q::Value>,
+        field: &q::Field,
         field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-    ) -> Result<r::Value, QueryExecutionError>;
+        arguments: &HashMap<&str, q::Value>,
+    ) -> Result<q::Value, QueryExecutionError>;
 
     /// Resolves an object, `prefetched_object` is `Some` if the parent already calculated the value.
     fn resolve_object(
         &self,
-        prefetched_object: Option<r::Value>,
-        field: &a::Field,
+        prefetched_object: Option<q::Value>,
+        field: &q::Field,
         field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-    ) -> Result<r::Value, QueryExecutionError>;
+        arguments: &HashMap<&str, q::Value>,
+    ) -> Result<q::Value, QueryExecutionError>;
 
     /// Resolves an enum value for a given enum type.
     fn resolve_enum_value(
         &self,
-        _field: &a::Field,
+        _field: &q::Field,
         _enum_type: &s::EnumType,
-        value: Option<r::Value>,
-    ) -> Result<r::Value, QueryExecutionError> {
-        Ok(value.unwrap_or(r::Value::Null))
+        value: Option<q::Value>,
+    ) -> Result<q::Value, QueryExecutionError> {
+        Ok(value.unwrap_or(q::Value::Null))
     }
 
     /// Resolves a scalar value for a given scalar type.
     fn resolve_scalar_value(
         &self,
         _parent_object_type: &s::ObjectType,
-        _field: &a::Field,
+        _field: &q::Field,
         _scalar_type: &s::ScalarType,
-        value: Option<r::Value>,
-    ) -> Result<r::Value, QueryExecutionError> {
+        value: Option<q::Value>,
+        _argument_values: &HashMap<&str, q::Value>,
+    ) -> Result<q::Value, QueryExecutionError> {
         // This code is duplicated.
         // See also c2112309-44fd-4a84-92a0-5a651e6ed548
-        Ok(value.unwrap_or(r::Value::Null))
+        Ok(value.unwrap_or(q::Value::Null))
     }
 
     /// Resolves a list of enum values for a given enum type.
     fn resolve_enum_values(
         &self,
-        _field: &a::Field,
+        _field: &q::Field,
         _enum_type: &s::EnumType,
-        value: Option<r::Value>,
-    ) -> Result<r::Value, Vec<QueryExecutionError>> {
-        Ok(value.unwrap_or(r::Value::Null))
+        value: Option<q::Value>,
+    ) -> Result<q::Value, Vec<QueryExecutionError>> {
+        Ok(value.unwrap_or(q::Value::Null))
     }
 
     /// Resolves a list of scalar values for a given list type.
     fn resolve_scalar_values(
         &self,
-        _field: &a::Field,
+        _field: &q::Field,
         _scalar_type: &s::ScalarType,
-        value: Option<r::Value>,
-    ) -> Result<r::Value, Vec<QueryExecutionError>> {
-        Ok(value.unwrap_or(r::Value::Null))
+        value: Option<q::Value>,
+    ) -> Result<q::Value, Vec<QueryExecutionError>> {
+        Ok(value.unwrap_or(q::Value::Null))
     }
 
     // Resolves an abstract type into the specific type of an object.
     fn resolve_abstract_type<'a>(
         &self,
-        schema: &'a ApiSchema,
+        schema: &'a s::Document,
         _abstract_type: &s::TypeDefinition,
-        object_value: &r::Value,
+        object_value: &q::Value,
     ) -> Option<&'a s::ObjectType> {
         let concrete_type_name = match object_value {
             // All objects contain `__typename`
-            r::Value::Object(data) => match &data.get("__typename").unwrap() {
-                r::Value::String(name) => name.clone(),
+            q::Value::Object(data) => match &data["__typename"] {
+                q::Value::String(name) => name.clone(),
                 _ => unreachable!("__typename must be a string"),
             },
             _ => unreachable!("abstract type value must be an object"),
@@ -106,12 +109,12 @@ pub trait Resolver: Sized + Send + Sync + 'static {
     }
 
     // Resolves a change stream for a given field.
-    fn resolve_field_stream(
+    async fn resolve_field_stream(
         &self,
-        _schema: &ApiSchema,
+        _schema: &s::Document,
         _object_type: &s::ObjectType,
-        _field: &a::Field,
-    ) -> Result<UnitStream, QueryExecutionError> {
+        _field: &q::Field,
+    ) -> Result<StoreEventStreamBox, QueryExecutionError> {
         Err(QueryExecutionError::NotSupported(String::from(
             "Resolving field streams is not supported by this resolver",
         )))

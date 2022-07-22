@@ -18,13 +18,12 @@ macro_rules! impl_slog_value {
 }
 
 use isatty;
+use lazy_static::lazy_static;
 use slog::*;
 use slog_async;
 use slog_envlogger;
 use slog_term::*;
-use std::{fmt, io, result};
-
-use crate::prelude::ENV_VARS;
+use std::{env, fmt, io, result};
 
 pub mod codes;
 pub mod elastic;
@@ -44,7 +43,12 @@ pub fn logger(show_debug: bool) -> Logger {
                 FilterLevel::Info
             },
         )
-        .parse(ENV_VARS.log_levels.as_deref().unwrap_or(""))
+        .parse(
+            env::var_os("GRAPH_LOG")
+                .unwrap_or_else(|| "".into())
+                .to_str()
+                .unwrap(),
+        )
         .build();
     let drain = slog_async::Async::new(drain)
         .chan_size(20000)
@@ -87,7 +91,8 @@ where
     fn format_custom(&self, record: &Record, values: &OwnedKVList) -> io::Result<()> {
         self.decorator.with_record(record, values, |mut decorator| {
             decorator.start_timestamp()?;
-            formatted_timestamp_local(&mut decorator)?;
+            timestamp_local(&mut decorator)?;
+
             decorator.start_whitespace()?;
             write!(decorator, " ")?;
 
@@ -370,10 +375,15 @@ impl ser::Serializer for KeyValueSerializer {
     }
 }
 
-fn formatted_timestamp_local(io: &mut impl io::Write) -> io::Result<()> {
-    write!(
-        io,
-        "{}",
-        chrono::Local::now().format(ENV_VARS.log_time_format.as_str())
-    )
+fn log_query_timing(kind: &str) -> bool {
+    env::var("GRAPH_LOG_QUERY_TIMING")
+        .unwrap_or_default()
+        .split(',')
+        .any(|v| v == kind)
+}
+
+lazy_static! {
+    pub static ref LOG_SQL_TIMING: bool = log_query_timing("sql");
+    pub static ref LOG_GQL_TIMING: bool = log_query_timing("gql");
+    pub static ref LOG_GQL_CACHE_TIMING: bool = *LOG_GQL_TIMING && log_query_timing("cache");
 }

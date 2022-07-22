@@ -8,19 +8,19 @@ use graph::{
     prelude::{SubgraphAssignmentProvider as SubgraphAssignmentProviderTrait, *},
 };
 
-pub struct SubgraphAssignmentProvider<I> {
+pub struct SubgraphAssignmentProvider<L, I> {
     logger_factory: LoggerFactory,
     subgraphs_running: Arc<Mutex<HashSet<DeploymentId>>>,
-    link_resolver: Arc<dyn LinkResolver>,
+    link_resolver: Arc<L>,
     instance_manager: Arc<I>,
 }
 
-impl<I: SubgraphInstanceManager> SubgraphAssignmentProvider<I> {
-    pub fn new(
-        logger_factory: &LoggerFactory,
-        link_resolver: Arc<dyn LinkResolver>,
-        instance_manager: I,
-    ) -> Self {
+impl<L, I> SubgraphAssignmentProvider<L, I>
+where
+    L: LinkResolver + CheapClone,
+    I: SubgraphInstanceManager,
+{
+    pub fn new(logger_factory: &LoggerFactory, link_resolver: Arc<L>, instance_manager: I) -> Self {
         let logger = logger_factory.component_logger("SubgraphAssignmentProvider", None);
         let logger_factory = logger_factory.with_parent(logger.clone());
 
@@ -28,19 +28,19 @@ impl<I: SubgraphInstanceManager> SubgraphAssignmentProvider<I> {
         SubgraphAssignmentProvider {
             logger_factory,
             subgraphs_running: Arc::new(Mutex::new(HashSet::new())),
-            link_resolver: link_resolver.with_retries().into(),
+            link_resolver: Arc::new(link_resolver.as_ref().cheap_clone().with_retries()),
             instance_manager: Arc::new(instance_manager),
         }
     }
 }
 
 #[async_trait]
-impl<I: SubgraphInstanceManager> SubgraphAssignmentProviderTrait for SubgraphAssignmentProvider<I> {
-    async fn start(
-        &self,
-        loc: DeploymentLocator,
-        stop_block: Option<BlockNumber>,
-    ) -> Result<(), SubgraphAssignmentProviderError> {
+impl<L, I> SubgraphAssignmentProviderTrait for SubgraphAssignmentProvider<L, I>
+where
+    L: LinkResolver,
+    I: SubgraphInstanceManager,
+{
+    async fn start(&self, loc: DeploymentLocator) -> Result<(), SubgraphAssignmentProviderError> {
         let logger = self.logger_factory.subgraph_logger(&loc);
 
         // If subgraph ID already in set
@@ -63,7 +63,7 @@ impl<I: SubgraphInstanceManager> SubgraphAssignmentProviderTrait for SubgraphAss
 
         self.instance_manager
             .cheap_clone()
-            .start_subgraph(loc, raw, stop_block)
+            .start_subgraph(loc, raw)
             .await;
 
         Ok(())

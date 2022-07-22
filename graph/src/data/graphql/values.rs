@@ -1,71 +1,49 @@
 use anyhow::{anyhow, Error};
-use std::collections::HashMap;
-use std::convert::TryFrom;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
-use crate::blockchain::BlockHash;
-use crate::data::value::Object;
-use crate::prelude::{r, BigInt, Entity};
-use web3::types::H160;
+use crate::prelude::{q, BigInt, Entity};
+use web3::types::{H160, H256};
 
 pub trait TryFromValue: Sized {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error>;
+    fn try_from_value(value: &q::Value) -> Result<Self, Error>;
 }
 
-impl TryFromValue for r::Value {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+impl TryFromValue for q::Value {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         Ok(value.clone())
     }
 }
 
 impl TryFromValue for bool {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::Boolean(b) => Ok(*b),
+            q::Value::Boolean(b) => Ok(*b),
             _ => Err(anyhow!("Cannot parse value into a boolean: {:?}", value)),
         }
     }
 }
 
 impl TryFromValue for String {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::String(s) => Ok(s.clone()),
-            r::Value::Enum(s) => Ok(s.clone()),
+            q::Value::String(s) => Ok(s.clone()),
+            q::Value::Enum(s) => Ok(s.clone()),
             _ => Err(anyhow!("Cannot parse value into a string: {:?}", value)),
         }
     }
 }
 
 impl TryFromValue for u64 {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::Int(n) => {
-                if *n >= 0 {
-                    Ok(*n as u64)
-                } else {
-                    Err(anyhow!("Cannot parse value into an integer/u64: {:?}", n))
-                }
-            }
-            // `BigInt`s are represented as `String`s.
-            r::Value::String(s) => u64::from_str(s).map_err(Into::into),
-            _ => Err(anyhow!(
-                "Cannot parse value into an integer/u64: {:?}",
-                value
-            )),
-        }
-    }
-}
+            q::Value::Int(n) => n
+                .as_i64()
+                .map(|n| n as u64)
+                .ok_or_else(|| anyhow!("Cannot parse value into an integer/u64: {:?}", n)),
 
-impl TryFromValue for i32 {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
-        match value {
-            r::Value::Int(n) => {
-                let n = *n;
-                i32::try_from(n).map_err(Error::from)
-            }
             // `BigInt`s are represented as `String`s.
-            r::Value::String(s) => i32::from_str(s).map_err(Into::into),
+            q::Value::String(s) => u64::from_str(s).map_err(Into::into),
             _ => Err(anyhow!(
                 "Cannot parse value into an integer/u64: {:?}",
                 value
@@ -75,9 +53,9 @@ impl TryFromValue for i32 {
 }
 
 impl TryFromValue for H160 {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::String(s) => {
+            q::Value::String(s) => {
                 // `H160::from_str` takes a hex string with no leading `0x`.
                 let string = s.trim_start_matches("0x");
                 H160::from_str(string).map_err(|e| {
@@ -92,20 +70,24 @@ impl TryFromValue for H160 {
     }
 }
 
-impl TryFromValue for BlockHash {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+impl TryFromValue for H256 {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::String(s) => BlockHash::from_str(s)
-                .map_err(|e| anyhow!("Cannot parse hex value from string `{}`: {}", s, e)),
-            _ => Err(anyhow!("Cannot parse non-string value: {:?}", value)),
+            q::Value::String(s) => {
+                // `H256::from_str` takes a hex string with no leading `0x`.
+                let string = s.trim_start_matches("0x");
+                H256::from_str(string)
+                    .map_err(|e| anyhow!("Cannot parse H256 value from string `{}`: {}", s, e))
+            }
+            _ => Err(anyhow!("Cannot parse value into an H256: {:?}", value)),
         }
     }
 }
 
 impl TryFromValue for BigInt {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::String(s) => BigInt::from_str(s)
+            q::Value::String(s) => BigInt::from_str(s)
                 .map_err(|e| anyhow!("Cannot parse BigInt value from string `{}`: {}", s, e)),
             _ => Err(anyhow!("Cannot parse value into an BigInt: {:?}", value)),
         }
@@ -116,9 +98,9 @@ impl<T> TryFromValue for Vec<T>
 where
     T: TryFromValue,
 {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::List(values) => values.iter().try_fold(vec![], |mut values, value| {
+            q::Value::List(values) => values.iter().try_fold(vec![], |mut values, value| {
                 values.push(T::try_from_value(value)?);
                 Ok(values)
             }),
@@ -129,9 +111,9 @@ where
 
 /// Assumes the entity is stored as a JSON string.
 impl TryFromValue for Entity {
-    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
         match value {
-            r::Value::String(s) => serde_json::from_str(s).map_err(Into::into),
+            q::Value::String(s) => serde_json::from_str(s).map_err(Into::into),
             _ => Err(anyhow!(
                 "Cannot parse entity, value is not a string: {:?}",
                 value
@@ -145,10 +127,10 @@ pub trait ValueMap {
     fn get_optional<T: TryFromValue>(&self, key: &str) -> Result<Option<T>, Error>;
 }
 
-impl ValueMap for r::Value {
+impl ValueMap for q::Value {
     fn get_required<T: TryFromValue>(&self, key: &str) -> Result<T, Error> {
         match self {
-            r::Value::Object(map) => map.get_required(key),
+            q::Value::Object(map) => map.get_required(key),
             _ => Err(anyhow!("value is not a map: {:?}", self)),
         }
     }
@@ -158,20 +140,20 @@ impl ValueMap for r::Value {
         T: TryFromValue,
     {
         match self {
-            r::Value::Object(map) => map.get_optional(key),
+            q::Value::Object(map) => map.get_optional(key),
             _ => Err(anyhow!("value is not a map: {:?}", self)),
         }
     }
 }
 
-impl ValueMap for &Object {
+impl ValueMap for &BTreeMap<String, q::Value> {
     fn get_required<T>(&self, key: &str) -> Result<T, Error>
     where
         T: TryFromValue,
     {
         self.get(key)
             .ok_or_else(|| anyhow!("Required field `{}` not set", key))
-            .and_then(T::try_from_value)
+            .and_then(|value| T::try_from_value(value).map_err(|e| e.into()))
     }
 
     fn get_optional<T>(&self, key: &str) -> Result<Option<T>, Error>
@@ -179,20 +161,20 @@ impl ValueMap for &Object {
         T: TryFromValue,
     {
         self.get(key).map_or(Ok(None), |value| match value {
-            r::Value::Null => Ok(None),
-            _ => T::try_from_value(value).map(Some),
+            q::Value::Null => Ok(None),
+            _ => T::try_from_value(value).map(Some).map_err(Into::into),
         })
     }
 }
 
-impl ValueMap for &HashMap<&str, r::Value> {
+impl ValueMap for &HashMap<&str, q::Value> {
     fn get_required<T>(&self, key: &str) -> Result<T, Error>
     where
         T: TryFromValue,
     {
         self.get(key)
             .ok_or_else(|| anyhow!("Required field `{}` not set", key))
-            .and_then(T::try_from_value)
+            .and_then(|value| T::try_from_value(value).map_err(|e| e.into()))
     }
 
     fn get_optional<T>(&self, key: &str) -> Result<Option<T>, Error>
@@ -200,8 +182,8 @@ impl ValueMap for &HashMap<&str, r::Value> {
         T: TryFromValue,
     {
         self.get(key).map_or(Ok(None), |value| match value {
-            r::Value::Null => Ok(None),
-            _ => T::try_from_value(value).map(Some),
+            q::Value::Null => Ok(None),
+            _ => T::try_from_value(value).map(Some).map_err(Into::into),
         })
     }
 }
@@ -212,19 +194,19 @@ pub trait ValueList {
         T: TryFromValue;
 }
 
-impl ValueList for r::Value {
+impl ValueList for q::Value {
     fn get_values<T>(&self) -> Result<Vec<T>, Error>
     where
         T: TryFromValue,
     {
         match self {
-            r::Value::List(values) => values.get_values(),
+            q::Value::List(values) => values.get_values(),
             _ => Err(anyhow!("value is not a list: {:?}", self)),
         }
     }
 }
 
-impl ValueList for Vec<r::Value> {
+impl ValueList for Vec<q::Value> {
     fn get_values<T>(&self) -> Result<Vec<T>, Error>
     where
         T: TryFromValue,
